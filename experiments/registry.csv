@@ -1,21 +1,26 @@
-> Current state of every patch across every tier. One row per patch.
-> Fill cells as tiers complete. "-" = not yet run. This file is the source of
-> truth for "where are we"; DECISIONS.md is the source of truth for "why".
+> Current state of every patch. Source of truth for "where are we";
+> DECISIONS.md is the source of truth for "why".
+>
+> CTC round 1 results are against anchor d6b40b789381601440e4ce2cc1164cd57e8c3c7d,
+> Class A1 (17f, 4K) and A2 (33f, 4K), Speed 4 for pruning patches, Speed 2 for
+> the bit-exact ones. Bar is the Complexity-to-Efficiency ratio
+> (speedup% / BD-rate%): >=20 at Speed 4, >=25 Speed 3, >=30 Speed 2, >=35 Speed 1.
 >
 > mechanism: reuse = caching/allocation/restore, MUST be bit-exact.
->            approx = prunes candidates, has a real quality cost to measure.
-> t1_instr%: instruction-count reduction from perf stat (deterministic).
-> t2_regret: sum(regret)/sum(RD) from shadow mode; lower is safer.
-> t4_bdrate: full CTC RA BD-rate, overall. t4_worst: worst single sequence.
-id,name,mechanism,expect_bitexact,t0_bitexact,t1_instr_pct,t2_regret,t4_bdrate,t4_worst,t4_speedup,status,notes
-i01,tx-type RD saturation exit,approx,no,n/a,-,-,-,-,-,ctc-round-1-running,"round-1 wall clock 6.5% [2.9,10.0]; real but CI crosses the 5% bar"
-i02,IST sparse coeff restore,reuse,YES,PASS,-,n/a,n/a,n/a,-,cleared-tier0,"BIT-EXACT. Zero quality risk on tested config; do NOT spend a CTC round. Speed still unmeasured (round-1 1.3% was below noise) -> needs Tier 1"
-i03,PICK_MODE_CONTEXT arena alloc,reuse,YES,PASS,-,n/a,n/a,n/a,-,cleared-tier0,"BIT-EXACT. Zero quality risk on tested config; do NOT spend a CTC round. Speed still unmeasured (round-1 1.2% was below noise) -> needs Tier 1"
-i04,sub-pel curvature gate,approx,no,n/a,-,-,-,-,-,hold,"round-1 0.5% = NOISE. Do not spend CTC until Tier 1 clears it"
-i05,full-pel search memoization,reuse,YES,PASS,-,n/a,n/a,n/a,-,cleared-tier0,"BIT-EXACT: the memo key is correct across DRL index and MV precision on the tested config. Zero quality risk; do NOT spend a CTC round. Speed still unmeasured (round-1 1.2% was below noise) -> needs Tier 1"
-i06,ext-partition texture pruning,approx,no,n/a,-,-,-,-,-,ctc-round-1-running,"round-1 17.2% [14.3,20.2]; only unambiguous win. Also the highest BD-rate risk: partition pruning at 4K is where quality is lost"
-i07,RD-density partition termination,approx,no,n/a,-,-,-,-,-,ctc-round-1-running,"round-1 3.2% [0.2,6.1]; real but under the 5% bar"
-i08,DRL dispersion budget,approx,no,n/a,-,-,-,-,-,hold,"round-1 1.9% = NOISE"
-i09,tx-partition stationarity pruning,approx,no,n/a,-,-,-,-,-,ctc-round-1-running,"round-1 7.8% [4.2,11.4]; real, CI straddles the 5% bar"
-i10,adaptive ME search range,approx,no,n/a,-,-,-,-,-,hold,"round-1 2.1% = NOISE"
-UNION,all applicable patches together,mixed,no,n/a,-,-,-,-,-,not-run,"i04/i05/i10 overlap in motion search; i01/i09 overlap in transform search. Individual gains will NOT add. This row is the number that decides whether the work was worth it"
+>            approx = prunes candidates, has a real quality cost.
+id,name,mechanism,t0_bitexact,ctc_speed,a1_speedup,a1_bdyuv,a1_ratio,a2_speedup,a2_bdyuv,a2_ratio,status,notes
+i09,tx-partition stationarity pruning,approx,n/a,4,+2.60%,+0.11%,23.6,+2.27%,+0.09%,25.2,PROMOTE,"Only patch passing the bar on BOTH classes. Modest but genuine. A2 ratio 25.2 also meets the Speed-3 bar; A1 23.6 does not, so scope it to Speed 4"
+i06,ext-partition texture pruning,approx,n/a,4,+14.00%,+0.75%,18.7,+18.52%,+1.29%,14.4,IMPROVE,"Only patch with real magnitude. Fails bar 20 on both, A2 binds. Needs A2 BD cut 1.29%->0.926% (-28%) at constant speed. A1 needs only -6.7%. Worse ratio on A2 despite HIGHER speedup => damage compounds temporally"
+i01,tx-type RD saturation exit,approx,n/a,4,+4.27%,+1.22%,3.5,+5.05%,+0.88%,5.7,DISCARD,"Real speedup but BD cost 4-6x too high. Gap to bar 20 is too large to tune"
+i07,RD-density partition termination,approx,n/a,4,+0.22%,+0.30%,0.7,+2.84%,+0.76%,3.7,DISCARD,"Near-zero speedup on A1, real BD cost on both"
+i08,DRL dispersion budget,approx,n/a,4,-0.45%,+0.04%,-11.3,+0.91%,-0.01%,inf,DISCARD,"Slower on A1. A2 'infinite ratio' is a rounding artifact of a -0.01% BD, not a win"
+i04,sub-pel curvature gate,approx,n/a,4,-1.31%,+0.11%,-11.9,+0.05%,-0.03%,inf,DISCARD,"Slower on A1, flat on A2. Confirms the round-1 paired data, which showed it as a slowdown while round-robin called it noise"
+i10,adaptive ME search range,approx,n/a,4,-0.14%,-0.04%,n/a,-0.71%,-0.20%,n/a,DISCARD,"Slower on BOTH classes. Negative BD is meaningless without a speedup"
+i02,IST sparse coeff restore,reuse,PASS,2,-2.34%,+0.00%,n/a,+0.41%(partial),+0.00%,inf,DISCARD,"Bit-exactness CONFIRMED by CTC: exactly +0.00% on every metric. But SLOWER on A1 4K. Zero risk, zero benefit"
+i03,PICK_MODE_CONTEXT arena alloc,reuse,PASS,2,-2.50%,+0.00%,n/a,+0.07%(partial),+0.00%,inf,DISCARD,"Bit-exactness CONFIRMED. Slowest of the three on A1. One large arena appears to cost more in locality at 4K than the many small allocations it replaced"
+i05,full-pel search memoization,reuse,PASS,2,-1.39%,+0.00%,n/a,-1.01%(partial),+0.00%,n/a,DISCARD,"Bit-exactness CONFIRMED, and the memo key is correct. But slower on both: at 4K the lookup is paid on every call and the hit rate does not repay it"
+BITEXACT-COMB,i02+i03+i05 together,reuse,n/a,2,-2.55%,+0.00%,n/a,-1.17%(partial),+0.00%,n/a,DISCARD,"The three together are slower than baseline. Confirms they are individually and jointly worthless as speed features"
+ALL10,all ten patches combined,mixed,n/a,4,+20.34%,+2.50%,8.1,+24.00%,+3.45%,7.0,DISCARD,"Dominated by i06. Backing i06 out implies the other nine give only ~7.4%/~6.7% speed for ~1.75%/~2.16% BD, a ratio of ~4.2/~3.1. The combination is i06 plus ballast"
+ALL10-S3,all ten combined at Speed 3,mixed,n/a,3,+25.18%,+3.12%,8.1,+29.25%,+3.85%,7.6,DISCARD,"Bar at Speed 3 is 25; ratio 8.1/7.6"
+ALL10-S2,all ten combined at Speed 2,mixed,n/a,2,+30.74%,+2.55%,12.1,n/a,n/a,n/a,DISCARD,"Best ratio of any combination (12.1) and still far under the Speed-2 bar of 30. Note the speedup rises at slower presets (30.7% at S2 vs 20.3% at S4) for near-identical BD, so the heuristics prune redundancy that only exists in deeper searches"
+I06+I09,proposed next combination,approx,n/a,4,~16.2%(est),~0.86%(est),~18.9,~20.4%(est),~1.38%(est),~14.8,NEXT-ROUND,"Estimated: speedups compound multiplicatively, BD additively. Barely better than i06 alone because i09 is small. This is the arm the next round should test, NOT all-10"

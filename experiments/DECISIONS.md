@@ -6,6 +6,114 @@ CTC slot rediscovering it.
 
 ---
 
+## 2026-08-12 — CTC round 1 results: 1 promote, 1 improve, 8 discard
+
+Anchor `d6b40b789381601440e4ce2cc1164cd57e8c3c7d`, Class A1 (17f 4K) and A2
+(33f 4K). Bar is the Complexity-to-Efficiency ratio, speedup% / BD-rate%:
+>=20 at Speed 4, >=25 S3, >=30 S2, >=35 S1.
+
+### PROMOTE — i09 (tx-partition stationarity)
+
++2.60% / +0.11% on A1 (ratio 23.6) and +2.27% / +0.09% on A2 (ratio 25.2). The
+only patch clearing the bar on **both** classes. Small, but it is a genuine
+speed feature and it is finished. Scope it to Speed 4: the A2 ratio would also
+meet the Speed-3 bar of 25, but A1's 23.6 would not.
+
+### IMPROVE — i06 (orientation partition pruning)
+
++14.00% / +0.75% on A1 (ratio 18.7), +18.52% / +1.29% on A2 (ratio 14.4). Fails
+the bar, but it is the only patch in the set with real magnitude, and it fails
+*close* on A1.
+
+The binding constraint is A2. To reach ratio 20 at unchanged speed it needs
+
+    A2: BD 1.29% -> 0.926%   (-28%)
+    A1: BD 0.75% -> 0.700%   ( -6.7%)
+
+The diagnostic that matters: **A2's ratio is worse than A1's despite a higher
+speedup.** A2 is 33 frames against A1's 17, so the extra loss is not in how much
+is pruned but in how long the consequences persist — the damage compounds
+through the reference structure. That points the fix at *which frames* get
+pruned, not just how hard.
+
+Three changes follow from reading the patch, in order of expected BD-rate
+returned per unit of speed given up:
+
+1. **Absolute variance floor.** The test is currently a pure *ratio*:
+   `var_cols * anisotropy < var_rows`. On a near-flat block both variances are
+   tiny and their ratio is noise, so a block with `var_rows=8, var_cols=1` is
+   pruned on no real evidence. Flat blocks also settle on PARTITION_NONE quickly,
+   so refusing to prune them should cost very little speed. Best ratio of the
+   three.
+2. **Temporal gating.** Do not prune (or require stronger anisotropy) on frames
+   high in the reference pyramid. Targets the propagation that the A1-vs-A2 gap
+   points to.
+3. **Raise the anisotropy thresholds** (`EXT_PART_ANISOTROPY 4`,
+   `RECT_PART_ANISOTROPY 8`). The blunt knob; trades speed roughly in
+   proportion, so it is the fallback rather than the fix.
+
+A fourth observation, not yet actioned: the profile is measured on the **source**
+only. For inter blocks it is the *residual* that determines whether a cut pays,
+and a strongly structured block that is well predicted has a flat residual. That
+makes the whole heuristic weakest exactly where A2 spends most of its frames.
+
+### DISCARD — everything else (8 of 10)
+
+- **i01** (+4.27%/+1.22%, ratio 3.5; +5.05%/+0.88%, 5.7). Real speedup, but the
+  BD cost is 4-6x too high. The gap to the bar is too large to tune out.
+- **i07** (+0.22%/+0.30%, 0.7; +2.84%/+0.76%, 3.7). Near-zero speedup on A1.
+- **i08** (-0.45% on A1; +0.91% on A2). Slower on A1. Its A2 "infinite ratio" is
+  an artifact of a -0.01% BD rounding to a gain, not a win.
+- **i04** (-1.31% A1, +0.05% A2). Slower. This is the outcome the round-1 paired
+  data already implied (-5.1%, -0.5% across two reps) while the round-robin
+  design called it noise.
+- **i10** (-0.14% A1, -0.71% A2). Slower on both classes.
+
+### DISCARD — the bit-exact three, for the opposite reason
+
+i02, i03 and i05 returned **exactly +0.00%** on every metric — PSNR-Y/U/V, SSIM,
+MS-SSIM, VMAF — across the complete A1 runs and the >85% A2 runs. The Tier-0
+prediction was correct, and it was available in 25 minutes for the cost of two
+short encodes rather than a CTC slot.
+
+But on A1 4K they are all *slower*: -2.34% (i02), -2.50% (i03), -1.39% (i05),
+and -2.55% for the three combined. Zero risk and zero benefit is not a feature.
+The mechanism is the same in each case — overhead that does not repay itself at
+4K scale:
+
+- i05 pays a memo lookup on every call, and at 4K the MV field is diverse enough
+  that the hit rate never repays it.
+- i03 replaces many small allocations, which fit in cache, with one large arena
+  that does not.
+- i02's sparse-restore bookkeeping loses to a bulk clear once blocks are large
+  and dense.
+
+The general lesson is that all three were designed against 416x240 intuitions
+about what is expensive, and 4K inverts them.
+
+### The strategic result: the combination is i06 plus ballast
+
+All ten together give +20.34%/+2.50% (ratio 8.1) on A1 and +24.00%/+3.45%
+(7.0) on A2. Backing i06 out of those numbers — speedups compound
+multiplicatively, BD-rate adds — leaves the other nine contributing
+
+    A1: ~7.4% speed for ~1.75% BD   ratio ~4.2
+    A2: ~6.7% speed for ~2.16% BD   ratio ~3.1
+
+So nine patches are collectively buying about a third of i06's speedup at more
+than twice its quality cost. **The next round must not test all-10 again.** The
+arm worth running is i06+i09, estimated at ~16.2%/~0.86% (18.9) on A1 and
+~20.4%/~1.38% (14.8) on A2 — barely better than i06 alone, because i09 is small
+and everything else is ballast.
+
+One finding worth keeping from the combination runs: the speedup *rises* at
+slower presets (+30.74% at Speed 2 vs +20.34% at Speed 4 on A1) for essentially
+unchanged BD-rate. These heuristics prune redundancy that only exists in deeper
+searches. The bars rise faster than the ratio does, so this does not rescue the
+set, but it is the right place to aim future pruning work.
+
+---
+
 ## 2026-08-12 — Tier 0 result: i02, i03, i05 are all BIT-EXACT
 
 Run on the fixed harness (clean-tree assertion active, patches verified isolated
