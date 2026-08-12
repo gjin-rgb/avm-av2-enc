@@ -108,12 +108,33 @@ before committing a full slot.
 Report **per-sequence BD-rate spread, not only the mean**. A patch averaging
 -0.05% while costing +0.4% on one sequence is a risk, not a win.
 
-## Combination
+## Combination, and the order to test in
 
-Measure patches one-at-a-time for attribution, but always also run the union.
-Several of these touch overlapping code (i04/i05/i10 all sit in motion search;
-i01/i09 both in transform search), so individual gains will not add. The union
-run is the number that decides whether the work was worth it.
+Several of these patches touch overlapping code — i04/i05/i10 all sit in motion
+search, i01/i09 both in transform search — so individual gains will not add.
+
+**Run the union first, not last.** The question that decides whether this work
+is worth continuing is "can this patch family reach >5% at an acceptable
+BD-rate?", and the union answers it in *one arm*. Ten one-at-a-time arms cost
+ten times as much and cannot answer it at all, because they never measure the
+combined effect. Only once the union clears the bar is per-patch attribution
+worth a round; if the union cannot clear it, no subset can, and the whole family
+can be dropped after a single CTC slot instead of ten.
+
+So: union first (go/no-go), then attribution on the survivors, then tuning.
+
+## Round economics
+
+- The anchor is fixed. Encode it **once** and reuse those results across every
+  round; re-encoding the anchor each round doubles the cost of every experiment
+  for no information.
+- Arms within a round are independent, so round *latency* is set by the slowest
+  arm, not the number of arms. Prefer few rounds with many arms over many rounds
+  with few. Anything that turns a serial sequence of rounds into one parallel
+  round is worth more than any single patch in this set.
+- Every patch killed at Tier 0/1/2 is an arm that does not have to be scheduled,
+  which is why the cheap tiers are worth building before the next round rather
+  than after it.
 
 ## Tools
 

@@ -40,6 +40,28 @@ interval:
 | i01 | 6.5% | [+2.9%, +10.0%] | straddles the bar |
 | i07 | 3.2% | [+0.2%, +6.1%] | real, under the bar |
 
+**Cross-check — the two round-1 datasets contradict each other.** The paired
+dataset (`measurements-runtime-paired.csv`, base and test in the same rep, which
+cancels machine drift) gives per-rep speedups that disagree with the round-robin
+verdicts:
+
+| patch | paired rep1 | paired rep2 | round-robin verdict | agrees? |
+|---|---|---|---|---|
+| i01 | -0.6% | +5.0% | "real, 6.5%" | no — sign flips |
+| i02 | +2.1% | +6.7% | NOISE | no |
+| i03 | -0.2% | +6.9% | NOISE | no — sign flips |
+| i04 | -5.1% | -0.5% | NOISE | consistently *slower* |
+| i05 | +2.4% | +0.5% | NOISE | yes |
+| i06 | +17.6% | +19.2% | +17.2% | yes |
+| i07 | +2.5% | +1.6% | +3.2% | yes |
+| i08 | +4.4% | +0.1% | NOISE | unstable |
+| i09 | +8.7% | +0.9% | +7.8% | no — 10x spread |
+| i10 | +0.9% | +9.1% | NOISE | no — 10x spread |
+
+Two independent measurements of the same quantity disagreeing this badly means
+neither is trustworthy. **i06 is the only patch that is stable across both
+designs and both datasets.** i04 appears to be a slowdown, not a speedup.
+
 **Second finding — regime mismatch.** Round 1 was measured on a single 416x240
 clip, 4 frames, `--cpu-used=4`. CTC RA is A1 4K + A2, 17/33 frames, at the CTC
 preset with 6 QPs. Partition and transform pruning heuristics depend directly on
