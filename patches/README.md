@@ -15,6 +15,98 @@ against unmodified `av2-enc`, and each was compiled and run before and after.
 
 ---
 
+## Results
+
+Measured at `--cpu-used=4`, single-threaded, 4 QPs (85/110/145/175), 4 frames of
+a 416×240 clip. BD-rate is PSNR-YUV weighted (6·Y + U + V)/8, Bjøntegaard cubic
+fit. Runtime is user CPU time, minimum of 7 samples per binary (see
+*Measurement* below for why the minimum).
+
+| # | Patch | Runtime | BD-rate | Ratio | s4 bar (≥20) |
+|---|-------|--------:|--------:|------:|:---:|
+| 01 | TX-type saturation exit | −6.40% | **−0.900%** | ∞ | pass |
+| 02 | IST sparse coeff restore | −0.75% | **0.000%** | ∞ | pass |
+| 03 | PMC arena allocation | −0.63% | **0.000%** | ∞ | pass |
+| 04 | Sub-pel curvature gate | −1.88% | **−0.597%** | ∞ | pass |
+| 05 | Full-pel search memo | −0.93% | **0.000%** | ∞ | pass |
+| 06 | Orientation partition pruning | **−16.53%** | +0.105% | 158 | pass |
+| 07 | RD-density termination | −2.47% | **−0.338%** | ∞ | pass |
+| 08 | DRL dispersion budget | −1.80% | +0.016% | 111 | pass |
+| 09 | TX-partition stationarity | −6.63% | +0.001% | 5368 | pass |
+| 10 | Adaptive ME search range | −1.67% | **−0.190%** | ∞ | pass |
+
+A negative BD-rate means less rate for the same quality. Patches 02, 03 and 05
+produced **byte-identical bitstreams at every QP**, so their BD-rate is zero by
+construction rather than by measurement, and their ratio is unbounded whatever
+the speed-up is. Patches 01, 04, 07 and 10 came out ahead on both axes on this
+clip, which makes their ratios unbounded too — but see the caveats.
+
+### What these numbers do and do not establish
+
+**They are a single 416×240 synthetic clip, 4 frames, 4 QPs — not a CTC
+evaluation.** Treat every BD-rate figure as indicative. Specifically:
+
+- **The BD-rate gains are the least trustworthy entries.** A pruning feature
+  improving compression is plausible — the RD search is greedy, so changing what
+  it visits can change what it finds — but it is not a property to rely on.
+  Digging into patch 01's −0.90%, most of it comes from chroma, and this clip's
+  chroma is an unnaturally smooth function of its luma. That one in particular
+  is likely an artefact of the content.
+- **The keyframe dominates the timing.** At 4 frames roughly half the measured
+  CPU time is the single intra frame, which flatters intra-affecting patches and
+  dilutes the inter-only ones (04, 05, 08, 10). Their true share of a long
+  sequence will be larger than shown.
+- **Only patches 06 and 09 have effects comfortably above the measurement
+  floor.** The sub-1% figures (02, 03, 05) are at the edge of what this
+  environment can resolve; their *direction* is trustworthy because those three
+  patches provably only remove work, but their magnitude is not precise.
+
+Before adopting any of these, re-run them over the AOM CTC set.
+
+### Measurement
+
+Runtime measurement had to be redone twice. Wall-clock timing was unusable — the
+same binary measured 71 s and 97 s on different occasions. User CPU time is
+repeatable to about 1% back-to-back, but drifts far more than that over the
+length of a sweep: in the RD sweep, binaries producing byte-identical bitstreams
+to the baseline appeared 3% *slower* at one QP and 8% *faster* at another, purely
+from when they happened to run. Two-repetition pairing did not fix it either
+(spreads up to 8 percentage points between repetitions).
+
+The figures above therefore come from a round-robin pass — every binary measured
+once per round, so all of them see the same fast and slow stretches — pooled
+with the paired pass, reduced by **minimum** rather than mean. Under contention
+the minimum is the observation closest to the true uncontended cost and is not
+dragged around by occasional slow runs. Sample counts are held equal between
+each variant and its baseline, since a minimum over more samples is
+systematically lower. Residual baseline spread after this treatment: 6%
+(86.44 s … 91.24 s over 7 samples).
+
+Rate and PSNR need none of this care: the encoder is deterministic, so those
+columns carry no measurement error at all.
+
+### Composing the patches
+
+The ratios above are per-patch against the baseline, which is how the threshold
+bars are defined. Several patches prune overlapping work — 01 and 09 both act on
+the transform search, 06 and 07 both on partitions — so their speed-ups do not
+simply add up. The stack was therefore measured rather than extrapolated:
+
+| | Runtime | BD-rate | Ratio |
+|---|--------:|--------:|------:|
+| **All ten together** | **−27.78%** | **−0.630%** | ∞ |
+
+(Naively multiplying the individual figures would have predicted ~34%, so the
+overlap costs about 6 points, as expected.)
+
+**Patches 05 and 10 conflict textually.** Both add code to
+`motion_search_facade.c` in the same region, so applying 10 after 05 fails. They
+are independent in substance — one memoises search results, the other picks the
+starting radius — and the conflict is a few lines of context. The combined build
+measured above resolves it by hand. Every other pair applies in any order.
+
+---
+
 ## What each patch does
 
 ### 0001 — Saturation-based exit for the transform type search
