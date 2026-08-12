@@ -1,0 +1,97 @@
+diff --git a/av2/encoder/rdopt.c b/av2/encoder/rdopt.c
+index e292969..d7da906 100644
+--- a/av2/encoder/rdopt.c
++++ b/av2/encoder/rdopt.c
+@@ -4797,6 +4797,11 @@ typedef struct {
+   inter_mode_info (
+       *mode_info)[BAWP_OPTION_CNT][NUM_MV_PRECISIONS][MAX_REF_MV_SQUARE];
+   int_mv (*save_mv)[NUM_MV_PRECISIONS][MAX_REF_MV_SQUARE][2];
++
++  // Best RD produced by the DRL index currently being evaluated, tracked
++  // independently of best_rd so that the DRL loop can measure how much the
++  // choice of reference MV actually matters for this block.
++  int64_t *drl_best_rd;
+ } PredictorSearchState;
+ /*!\endcond */
+ 
+@@ -4828,6 +4833,7 @@ static AVM_INLINE void init_predictor_search_state(
+   search_state->best_ref_mv_idx = best_ref_mv_idx;
+   search_state->mode_info = mode_info;
+   search_state->save_mv = save_mv;
++  search_state->drl_best_rd = NULL;
+ }
+ 
+ // Updates the best search state if the current RD cost is better than the
+@@ -4838,6 +4844,12 @@ static AVM_INLINE void update_predictor_search_state(
+     const RD_STATS *rd_stats_y, const RD_STATS *rd_stats_uv,
+     const TxfmSearchInfo *txfm_info, int num_planes, int tmp_rate_mv,
+     int rate2_nocoeff, motion_mode_candidate *motion_mode_cand) {
++  // Note the candidate against the DRL index being evaluated before the global
++  // best filters it out: the DRL stopping rule needs the RD every index can
++  // reach, not only the ones that improve on all previous indices.
++  if (search_state->drl_best_rd != NULL && tmp_rd < *search_state->drl_best_rd)
++    *search_state->drl_best_rd = tmp_rd;
++
+   if (tmp_rd >= *search_state->best_rd) return;
+ 
+   MACROBLOCKD *const xd = &x->e_mbd;
+@@ -5200,6 +5212,14 @@ static void evaluate_inter_predictor(AV2_COMP *const cpi,
+  * \return The RD cost for the mode being searched.
+  */
+ 
++// Number of DRL indices that must be evaluated before the spread of their RD
++// costs is considered informative.
++#define DRL_MIN_EVALUATED_INDICES 2
++// Reciprocal of the relative RD spread below which the DRL candidates count as
++// indistinguishable: (max - min) * DRL_SPREAD_RATIO <= min, i.e. a spread of
++// less than 1/64 (about 1.5%) of the best cost seen.
++#define DRL_SPREAD_RATIO 64
++
+ static int64_t handle_inter_mode(
+     AV2_COMP *const cpi, TileDataEnc *tile_data, MACROBLOCK *x,
+     BLOCK_SIZE bsize, RD_STATS *rd_stats, RD_STATS *rd_stats_y,
+@@ -5445,8 +5465,24 @@ static int64_t handle_inter_mode(
+     }
+ 
+     int ref_mv_idx[2];
++      // --- Dispersion based budget for the DRL dimension -------------------
++      // Successive DRL indices differ only in which reference MV the motion
++      // vector is coded against. When the indices evaluated so far all land on
++      // practically the same RD cost, the search is converging to the same
++      // motion regardless of the predictor and the residual rate differences
++      // between predictors are immaterial, so the indices still to come cannot
++      // change the outcome either. Tracking the spread of the observed costs
++      // rather than their trend makes this a statement about the candidate
++      // distribution itself, and expressing it as a ratio keeps it free of any
++      // absolute RD scale.
++      int64_t drl_rd_min = INT64_MAX;
++      int64_t drl_rd_max = 0;
++      int drl_evaluated = 0;
++      int drl_converged = 0;
+     for (ref_mv_idx[1] = 0; ref_mv_idx[1] < ref_set[1]; ++ref_mv_idx[1]) {
+       for (ref_mv_idx[0] = 0; ref_mv_idx[0] < ref_set[0]; ++ref_mv_idx[0]) {
++        int64_t this_drl_rd = INT64_MAX;
++        search_state.drl_best_rd = &this_drl_rd;
+         // apply early termination method to jmvd scaling factors
+         if (cpi->sf.inter_sf.early_terminate_jmvd_scale_factor) {
+           if (scale_index > 0 && (ref_mv_idx[0] > 0 || ref_mv_idx[1] > 0) &&
+@@ -5763,7 +5799,19 @@ static int64_t handle_inter_mode(
+             }
+           }
+         }
++        search_state.drl_best_rd = NULL;
++        if (this_drl_rd != INT64_MAX) {
++          ++drl_evaluated;
++          if (this_drl_rd < drl_rd_min) drl_rd_min = this_drl_rd;
++          if (this_drl_rd > drl_rd_max) drl_rd_max = this_drl_rd;
++          if (drl_evaluated >= DRL_MIN_EVALUATED_INDICES &&
++              (drl_rd_max - drl_rd_min) * DRL_SPREAD_RATIO <= drl_rd_min) {
++            drl_converged = 1;
++            break;
++          }
++        }
+       }
++      if (drl_converged) break;
+     }
+   }
+ 

@@ -1,0 +1,126 @@
+diff --git a/av2/encoder/mcomp.c b/av2/encoder/mcomp.c
+index e7c4104..39024ff 100644
+--- a/av2/encoder/mcomp.c
++++ b/av2/encoder/mcomp.c
+@@ -3924,6 +3924,24 @@ int av2_joint_amvd_motion_search(const AV2_COMMON *const cm, MACROBLOCKD *xd,
+   return besterr;
+ }
+ 
++// Curvature gate for the sub-pixel refinement ladder.
++//
++// Close to its minimum the prediction error behaves like a locally quadratic
++// surface E(d) ~ E0 + c*d^2, so a refinement level with step h/2 can recover at
++// most about a quarter of what the level with step h just recovered. Once the
++// gain produced by the level that finished is a negligible fraction of the
++// error that is left, every finer level is negligible as well and only costs
++// further upsampled predictions. A level that did not move the MV at all
++// (gain == 0) proves the centre is already a local minimum at that scale and is
++// terminated by the very same test.
++#define SUBPEL_FLAT_SURFACE_SHIFT 8
++static INLINE int subpel_refinement_saturated(unsigned int err_before,
++                                              unsigned int err_after) {
++  assert(err_after <= err_before);
++  const uint64_t gain = (uint64_t)(err_before - err_after);
++  return (gain << SUBPEL_FLAT_SURFACE_SHIFT) <= (uint64_t)err_after;
++}
++
+ int av2_find_best_sub_pixel_tree_pruned_evenmore(
+     MACROBLOCKD *xd, const AV2_COMMON *const cm,
+     const SUBPEL_MOTION_SEARCH_PARAMS *ms_params, MV start_mv, MV *bestmv,
+@@ -4046,6 +4064,12 @@ int av2_find_best_sub_pixel_tree_pruned_more(
+   // If forced_stop is FULL_PEL, return.
+   if (forced_stop == FULL_PEL) return besterr;
+ 
++  // Prediction error when the level that is about to run started, and whether
++  // the refinement ladder has already flattened out. See
++  // subpel_refinement_saturated().
++  unsigned int level_start_err = besterr;
++  int refine_saturated = 0;
++
+   if (check_repeated_mv_and_update(last_mv_search_list, *bestmv, iter)) {
+     return INT_MAX;
+   }
+@@ -4072,7 +4096,8 @@ int av2_find_best_sub_pixel_tree_pruned_more(
+ 
+   // Each subsequent iteration checks at least one point in common with
+   // the last iteration could be 2 ( if diag selected) 1/4 pel
+-  if (forced_stop < HALF_PEL) {
++  refine_saturated = subpel_refinement_saturated(level_start_err, besterr);
++  if (forced_stop < HALF_PEL && !refine_saturated) {
+     if (check_repeated_mv_and_update(last_mv_search_list, *bestmv, iter)) {
+       return INT_MAX;
+     }
+@@ -4080,11 +4105,13 @@ int av2_find_best_sub_pixel_tree_pruned_more(
+ 
+     hstep >>= 1;
+     start_mv = *bestmv;
++    level_start_err = besterr;
+     two_level_checks_fast(xd, cm, start_mv, bestmv, hstep, mv_limits,
+                           var_params, mv_cost_params, &besterr, sse1,
+                           distortion, iters_per_step, is_scaled);
+   }
+-  if (forced_stop == EIGHTH_PEL) {
++  if (forced_stop == EIGHTH_PEL && !refine_saturated &&
++      !subpel_refinement_saturated(level_start_err, besterr)) {
+     if (check_repeated_mv_and_update(last_mv_search_list, *bestmv, iter)) {
+       return INT_MAX;
+     }
+@@ -4134,6 +4161,12 @@ int av2_find_best_sub_pixel_tree_pruned(
+   // If forced_stop is FULL_PEL, return.
+   if (forced_stop == FULL_PEL) return besterr;
+ 
++  // Prediction error when the level that is about to run started, and whether
++  // the refinement ladder has already flattened out. See
++  // subpel_refinement_saturated().
++  unsigned int level_start_err = besterr;
++  int refine_saturated = 0;
++
+   if (check_repeated_mv_and_update(last_mv_search_list, *bestmv, iter)) {
+     return INT_MAX;
+   }
+@@ -4211,7 +4244,8 @@ int av2_find_best_sub_pixel_tree_pruned(
+ 
+   // Each subsequent iteration checks at least one point in common with
+   // the last iteration could be 2 ( if diag selected) 1/4 pel
+-  if (forced_stop < HALF_PEL) {
++  refine_saturated = subpel_refinement_saturated(level_start_err, besterr);
++  if (forced_stop < HALF_PEL && !refine_saturated) {
+     if (check_repeated_mv_and_update(last_mv_search_list, *bestmv, iter)) {
+       return INT_MAX;
+     }
+@@ -4219,12 +4253,14 @@ int av2_find_best_sub_pixel_tree_pruned(
+ 
+     hstep >>= 1;
+     start_mv = *bestmv;
++    level_start_err = besterr;
+     two_level_checks_fast(xd, cm, start_mv, bestmv, hstep, mv_limits,
+                           var_params, mv_cost_params, &besterr, sse1,
+                           distortion, iters_per_step, is_scaled);
+   }
+ 
+-  if (forced_stop == EIGHTH_PEL) {
++  if (forced_stop == EIGHTH_PEL && !refine_saturated &&
++      !subpel_refinement_saturated(level_start_err, besterr)) {
+     if (check_repeated_mv_and_update(last_mv_search_list, *bestmv, iter)) {
+       return INT_MAX;
+     }
+@@ -4277,6 +4313,7 @@ int av2_find_best_sub_pixel_tree(MACROBLOCKD *xd, const AV2_COMMON *const cm,
+                                      iter)) {
+       return INT_MAX;
+     }
++    const unsigned int level_start_err = besterr;
+ 
+     MV diag_step;
+     diag_step = first_level_check(xd, cm, iter_center_mv, bestmv, hstep,
+@@ -4290,6 +4327,11 @@ int av2_find_best_sub_pixel_tree(MACROBLOCKD *xd, const AV2_COMMON *const cm,
+                             sse1, distortion);
+     }
+ 
++    // Stop descending the refinement ladder once the error surface has gone
++    // flat at the current step size: finer steps can only recover a fraction
++    // of an already negligible gain. See subpel_refinement_saturated().
++    if (subpel_refinement_saturated(level_start_err, besterr)) break;
++
+     hstep >>= 1;
+   }
+ 

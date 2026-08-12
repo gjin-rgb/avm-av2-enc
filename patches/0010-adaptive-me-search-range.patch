@@ -1,0 +1,107 @@
+diff --git a/av2/encoder/motion_search_facade.c b/av2/encoder/motion_search_facade.c
+index 905a06f..d601ff8 100644
+--- a/av2/encoder/motion_search_facade.c
++++ b/av2/encoder/motion_search_facade.c
+@@ -41,6 +41,80 @@ static int compare_weight(const void *a, const void *b) {
+ }
+ 
+ // Allow more mesh searches for screen content type on the ARF.
++// Number of spatial predictors that must be present before their agreement
++// says anything about the local motion field.
++#define MV_FIELD_MIN_CANDIDATES 2
++
++// Spread of the local motion field, in full pixels, mapped to the number of
++// step search levels that can be given up at the coarse end. Each level dropped
++// halves the radius the search starts from, so the mapping is deliberately
++// gentle: a field that is merely fairly coherent gives up one level, and only a
++// field whose predictors are practically identical gives up three.
++static const struct {
++  int max_spread;
++  int step_gain;
++} mv_field_coherence_ladder[] = {
++  { 1, 3 },
++  { 3, 2 },
++  { 8, 1 },
++};
++
++// Reports how many step search levels the coarse end of the full pixel search
++// can give up for this block and reference frame.
++//
++// The step search starts from a radius wide enough to cover the worst case
++// motion anywhere in the frame and works inwards, spending several rounds of
++// SAD evaluations before it even reaches the neighbourhood of the predictor.
++// That width only earns its keep when the true motion may genuinely be far from
++// the predictor. The reference MV stack is precisely the local motion field -
++// the motion that the spatially adjacent blocks settled on - so its spread is a
++// direct measurement of how far the search plausibly has to travel. A tight
++// field concentrates the probability mass of the true motion vector around the
++// predictor, and the wide outer rings then only spend SADs on positions the
++// search will not keep.
++//
++// The response is graded rather than all or nothing: the range shrinks in
++// proportion to how coherent the field actually is, and the fine levels that do
++// the real locating are never touched.
++static int mv_field_coherent_step_gain(const MACROBLOCK *x,
++                                       MV_REFERENCE_FRAME ref_frame) {
++  const MB_MODE_INFO_EXT *const mbmi_ext = x->mbmi_ext;
++  const int num_candidates = mbmi_ext->ref_mv_count[ref_frame];
++  if (num_candidates < MV_FIELD_MIN_CANDIDATES) return 0;
++
++  const CANDIDATE_MV *const stack = mbmi_ext->ref_mv_stack[ref_frame];
++  int num_spatial = 0;
++  int min_row = INT_MAX, max_row = INT_MIN;
++  int min_col = INT_MAX, max_col = INT_MIN;
++
++  for (int i = 0; i < num_candidates && i < USABLE_REF_MV_STACK_SIZE; ++i) {
++    // Only spatial neighbours describe the local motion field; temporal and
++    // rescaled candidates say nothing about it.
++    if (stack[i].row_offset == OFFSET_NONSPATIAL &&
++        stack[i].col_offset == OFFSET_NONSPATIAL) {
++      continue;
++    }
++    const int row = GET_MV_RAWPEL(stack[i].this_mv.as_mv.row);
++    const int col = GET_MV_RAWPEL(stack[i].this_mv.as_mv.col);
++    if (row < min_row) min_row = row;
++    if (row > max_row) max_row = row;
++    if (col < min_col) min_col = col;
++    if (col > max_col) max_col = col;
++    ++num_spatial;
++  }
++
++  if (num_spatial < MV_FIELD_MIN_CANDIDATES) return 0;
++
++  const int spread = AVMMAX(max_row - min_row, max_col - min_col);
++  for (size_t i = 0; i < sizeof(mv_field_coherence_ladder) /
++                             sizeof(mv_field_coherence_ladder[0]);
++       ++i) {
++    if (spread <= mv_field_coherence_ladder[i].max_spread)
++      return mv_field_coherence_ladder[i].step_gain;
++  }
++  return 0;
++}
++
+ static int use_fine_search_interval(const AV2_COMP *const cpi) {
+   return cpi->is_screen_content_type &&
+          (cpi->gf_group.update_type[cpi->gf_group.index] == ARF_UPDATE ||
+@@ -211,6 +285,21 @@ void av2_single_motion_search(const AV2_COMP *const cpi, MACROBLOCK *x,
+     }
+   }
+ 
++  // Give up the widest step search levels when the neighbouring blocks all
++  // settled on the same motion. See mv_field_coherent_step_gain(). The gain is
++  // clamped so that the search always keeps at least one level to run.
++  if (mbmi->motion_mode == SIMPLE_TRANSLATION) {
++    const int step_gain = mv_field_coherent_step_gain(x, ref);
++    if (step_gain > 0) {
++      const search_site_config *const coherence_cfg =
++          &mv_search_params
++               ->search_site_cfg[SS_CFG_SRC][cpi->sf.mv_sf.search_method];
++      const int max_step_param = coherence_cfg->num_search_steps - 1;
++      step_param = AVMMIN(step_param + step_gain, max_step_param);
++      if (step_param < 0) step_param = 0;
++    }
++  }
++
+   int cost_list[5];
+   int_mv second_best_mv;
+   best_mv->as_int = second_best_mv.as_int = INVALID_MV;

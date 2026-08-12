@@ -1,0 +1,85 @@
+diff --git a/av2/encoder/tx_search.c b/av2/encoder/tx_search.c
+index 2af0748..9e5cc25 100644
+--- a/av2/encoder/tx_search.c
++++ b/av2/encoder/tx_search.c
+@@ -2468,6 +2468,24 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
+                    !is_fsc && !is_lossless;
+ 
+   const int max_eob = av2_get_max_eob(tx_size);
++
++  // --- Diminishing-returns state for the transform type search ---------------
++  // The candidate order in txk_map is a prior ranking (ML / heuristic), so the
++  // RD cost of the evaluated candidates behaves like a decreasing sequence that
++  // flattens out quickly. Rather than walking the whole ranked list, track how
++  // the search is converging and stop once it has saturated:
++  //   * num_rd_evals   - candidates that reached an actual RD evaluation,
++  //   * stale_run      - consecutive evaluations that did not beat best_rd,
++  //   * last_rd_gain   - absolute RD improvement of the most recent winner.
++  // A small last_rd_gain relative to best_rd means the sequence has already
++  // converged, so the tolerated stale run is shortened. The same holds when the
++  // winning candidate produced a very compact residual (small eob): the
++  // transform already concentrated the energy and the remaining kernels have
++  // little room left to improve on it.
++  int num_rd_evals = 0;
++  int stale_run = 0;
++  int64_t last_rd_gain = INT64_MAX;
++
+   // Iterate through all transform type candidates.
+   for (int tx_idx = 0; tx_idx < TX_TYPES; ++tx_idx) {
+     if (is_fsc && (txw > FSC_MAXWIDTH || txh > FSC_MAXHEIGHT) &&
+@@ -2672,7 +2690,10 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
+           assert(this_rd_stats.dist == 0);
+         }
+ 
++        ++num_rd_evals;
+         if (rd < best_rd) {
++          last_rd_gain = (best_rd == INT64_MAX) ? INT64_MAX : best_rd - rd;
++          stale_run = 0;
+           best_rd = rd;
+           *best_rd_stats = this_rd_stats;
+           best_tx_type = packed_tx_type;
+@@ -2682,6 +2703,8 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
+           tran_low_t *const tmp_dqcoeff = best_dqcoeff;
+           best_dqcoeff = mb_plane->dqcoeff;
+           mb_plane->dqcoeff = tmp_dqcoeff;
++        } else {
++          ++stale_run;
+         }
+ 
+ #if CONFIG_COLLECT_RD_STATS == 1
+@@ -2719,6 +2742,35 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
+           break;
+         }
+ 
++        // Saturation based termination of the transform type search.
++        //
++        // The candidates are visited in prior-ranked order, so the running
++        // best RD forms a decreasing, rapidly flattening sequence. Stop as
++        // soon as that sequence looks converged instead of exhausting the
++        // ranked list. The tolerated run of non-improving candidates is
++        // derived from two observations made during the search itself:
++        //   - a marginal last win (< ~1.6% of best_rd) means the sequence has
++        //     already flattened out,
++        //   - a very compact winning residual (eob <= max_eob / 8) means the
++        //     energy is already concentrated and the remaining kernels have
++        //     little left to gain.
++        // The starting budget follows the preset aggressiveness that
++        // search_level already encodes, so conservative presets keep
++        // searching longer before declaring saturation.
++        if (num_rd_evals >= 3) {
++          int stale_budget = search_level ? 3 : 5;
++          if (last_rd_gain != INT64_MAX && best_rd != INT64_MAX &&
++              last_rd_gain < (best_rd >> 6)) {
++            --stale_budget;
++          }
++          if (best_eob > 0 && (int)best_eob * 8 <= max_eob) --stale_budget;
++          if (stale_budget < 1) stale_budget = 1;
++          if (stale_run >= stale_budget) {
++            skip_idx = true;
++            break;
++          }
++        }
++
+         // Terminate transform type search if the block has been quantized to
+         // all zero.
+         if (tx_sf->tx_type_search.skip_tx_search && !best_eob &&

@@ -1,0 +1,118 @@
+diff --git a/av2/encoder/context_tree.c b/av2/encoder/context_tree.c
+index e8acb1e..5c42ce7 100644
+--- a/av2/encoder/context_tree.c
++++ b/av2/encoder/context_tree.c
+@@ -273,6 +273,7 @@ PC_TREE *av2_alloc_pc_tree_node(TREE_TYPE tree_type, int mi_row, int mi_col,
+   pc_tree->is_last_subblock = is_last;
+   av2_invalid_rd_stats(&pc_tree->rd_cost);
+   av2_invalid_rd_stats(&pc_tree->none_rd);
++  pc_tree->none_rd_per_pixel = INT64_MAX;
+   pc_tree->skippable = false;
+   set_chroma_ref_info(tree_type, mi_row, mi_col, index, bsize,
+                       &pc_tree->chroma_ref_info,
+diff --git a/av2/encoder/context_tree.h b/av2/encoder/context_tree.h
+index 47461ce..8438f36 100644
+--- a/av2/encoder/context_tree.h
++++ b/av2/encoder/context_tree.h
+@@ -92,6 +92,11 @@ typedef struct PC_TREE {
+   CHROMA_REF_INFO chroma_ref_info;
+   RD_STATS rd_cost;
+   RD_STATS none_rd;
++  // RD cost of this node's PARTITION_NONE evaluation divided by the number of
++  // pixels it covers. This normalisation makes the figure comparable across
++  // block sizes, so a node can be related to its parent. INT64_MAX until the
++  // node's PARTITION_NONE has been evaluated.
++  int64_t none_rd_per_pixel;
+   bool skippable;
+   CFL_ALLOWED_FOR_SDP_TYPE is_cfl_allowed_for_this_chroma;
+   int sb_root_partition_info;
+diff --git a/av2/encoder/partition_search.c b/av2/encoder/partition_search.c
+index cae1da5..036481c 100644
+--- a/av2/encoder/partition_search.c
++++ b/av2/encoder/partition_search.c
+@@ -3541,8 +3541,53 @@ static void rectangular_partition_search(
+   }
+ }
+ 
++// How many times cheaper per pixel a block must be than its parent before its
++// remaining partition trials are considered not worth running.
++#define RD_DENSITY_PRUNE_RATIO 2
++
++// Terminates the finer partition trials of a block that is already coding far
++// more efficiently than the region it was cut out of.
++//
++// PARTITION_NONE has just won for this block, and its RD cost per pixel is
++// known. Normalising by area makes that figure directly comparable with the
++// parent's, which covers a larger region: an even split of the parent's cost
++// would leave every child at the parent's density, so a child well below it sits
++// in a part of the frame that is intrinsically easier than its surroundings.
++// The absolute RD still available to a finer split of such a block is bounded by
++// its already small total cost, while each extra partition level keeps costing
++// signalling. Rectangular and extended trials are therefore dropped, and
++// PARTITION_SPLIT - by far the most valuable of the remaining options - is
++// deliberately left alone.
++//
++// Being a ratio between two RD costs, the test carries no absolute scale and so
++// adapts to content and quantiser on its own.
++static AVM_INLINE void prune_partitions_by_rd_density(
++    const PC_TREE *pc_tree, PartitionSearchState *part_search_state) {
++  if (part_search_state->forced_partition != PARTITION_INVALID) return;
++  if (pc_tree->parent == NULL) return;
++
++  const BLOCK_SIZE bsize = part_search_state->part_blk_params.bsize;
++  if (block_size_wide[bsize] <= 8 || block_size_high[bsize] <= 8) return;
++
++  const int64_t this_density = pc_tree->none_rd_per_pixel;
++  const int64_t parent_density = pc_tree->parent->none_rd_per_pixel;
++  if (this_density == INT64_MAX || parent_density == INT64_MAX) return;
++  if (this_density * RD_DENSITY_PRUNE_RATIO >= parent_density) return;
++
++  part_search_state->do_rectangular_split = false;
++  part_search_state->prune_partition[PARTITION_HORZ] = true;
++  part_search_state->prune_partition[PARTITION_VERT] = true;
++  part_search_state->prune_partition[PARTITION_HORZ_3] = true;
++  part_search_state->prune_partition[PARTITION_VERT_3] = true;
++  part_search_state->prune_partition[PARTITION_HORZ_4A] = true;
++  part_search_state->prune_partition[PARTITION_HORZ_4B] = true;
++  part_search_state->prune_partition[PARTITION_VERT_4A] = true;
++  part_search_state->prune_partition[PARTITION_VERT_4B] = true;
++}
++
+ // Skip other partitions based on PARTITION_NONE rd cost.
+ static void prune_partitions_after_none(AV2_COMP *const cpi, MACROBLOCK *x,
++                                        const PC_TREE *pc_tree,
+                                         SIMPLE_MOTION_DATA_TREE *sms_tree,
+                                         PICK_MODE_CONTEXT *ctx_none,
+                                         PartitionSearchState *part_search_state,
+@@ -3558,6 +3603,8 @@ static void prune_partitions_after_none(AV2_COMP *const cpi, MACROBLOCK *x,
+ 
+   (void)sms_tree;
+ 
++  prune_partitions_by_rd_density(pc_tree, part_search_state);
++
+   if (!frame_is_intra_only(cm) && part_search_state->do_rectangular_split &&
+       !xd->lossless[xd->mi[0]->segment_id] && ctx_none->skippable) {
+     const int use_ml_based_breakout =
+@@ -3885,6 +3932,13 @@ static void none_partition_search(
+     }
+     *part_none_rd = this_rdc->rdcost;
+ 
++    // Record how expensive this block is per pixel when coded whole, so that
++    // descendants can compare themselves against it. See
++    // prune_partitions_by_rd_density().
++    if (this_rdc->rdcost < INT64_MAX && this_rdc->rdcost >= 0) {
++      pc_tree->none_rd_per_pixel = this_rdc->rdcost / (int64_t)(bw * bh);
++    }
++
+     if (this_rdc->rdcost < best_rdc->rdcost) {
+       *best_rdc = *this_rdc;
+       update_best_level_banks(level_banks, &x->e_mbd);
+@@ -3893,7 +3947,7 @@ static void none_partition_search(
+         pc_tree->partitioning = PARTITION_NONE;
+         // Disable split and rectangular partition search based on
+         // PARTITION_NONE cost.
+-        prune_partitions_after_none(cpi, x, sms_tree, *ctx_none,
++        prune_partitions_after_none(cpi, x, pc_tree, sms_tree, *ctx_none,
+                                     part_search_state, best_rdc,
+                                     pb_source_variance);
+       }

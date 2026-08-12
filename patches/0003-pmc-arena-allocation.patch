@@ -1,0 +1,204 @@
+diff --git a/av2/encoder/context_tree.c b/av2/encoder/context_tree.c
+index e8acb1e..f73a854 100644
+--- a/av2/encoder/context_tree.c
++++ b/av2/encoder/context_tree.c
+@@ -132,68 +132,125 @@ static INLINE int get_num_pix_bsize_base(
+   return block_size_wide[bsize_base] * block_size_high[bsize_base];
+ }
+ 
++// A PICK_MODE_CONTEXT owns a fixed set of small per-4x4-block arrays whose
++// sizes are known the moment the block size is known, and which are never
++// resized afterwards. The partition search however allocates and destroys
++// contexts constantly: every rectangular, split and extended partition trial
++// tears down a subtree and builds a fresh one. Handing each of those arrays its
++// own heap block therefore costs 17 malloc/free pairs per context and scatters
++// data that is always walked together across the heap.
++//
++// Instead, lay the context and all of its arrays out in a single arena so that
++// one allocation serves the whole context, one free releases it, and the
++// metadata is contiguous in memory.
++#define PMC_ARENA_ALIGN 32
++
++// Reserves `bytes` at the end of the arena described by `size` and returns the
++// offset of the reservation. Every reservation is padded so that the next one
++// stays PMC_ARENA_ALIGN aligned, which preserves the alignment the individual
++// avm_memalign() calls used to guarantee.
++static INLINE size_t pmc_arena_reserve(size_t *size, size_t bytes) {
++  const size_t offset = *size;
++  *size = offset + ((bytes + (PMC_ARENA_ALIGN - 1)) & ~(size_t)(PMC_ARENA_ALIGN - 1));
++  return offset;
++}
++
+ PICK_MODE_CONTEXT *av2_alloc_pmc(const AV2_COMMON *cm, TREE_TYPE tree_type,
+                                  int mi_row, int mi_col, BLOCK_SIZE bsize,
+                                  PC_TREE *parent,
+                                  PARTITION_TYPE parent_partition, int index,
+                                  int subsampling_x, int subsampling_y,
+                                  PC_TREE_SHARED_BUFFERS *shared_bufs) {
+-  PICK_MODE_CONTEXT *ctx = NULL;
+   struct avm_internal_error_info error;
+ 
+-  AVM_CHECK_MEM_ERROR(&error, ctx, avm_calloc(1, sizeof(*ctx)));
+-  ctx->rd_mode_is_ready = 0;
+-  ctx->parent = parent;
+-  ctx->index = index;
+-  set_chroma_ref_info(tree_type, mi_row, mi_col, index, bsize,
+-                      &ctx->chroma_ref_info,
+-                      parent ? &parent->chroma_ref_info : NULL,
+-                      parent ? parent->block_size : BLOCK_INVALID,
+-                      parent_partition, subsampling_x, subsampling_y);
+-  ctx->mic.chroma_ref_info = ctx->chroma_ref_info;
+-
+   const int num_planes = av2_num_planes(cm);
+   const int num_pix = block_size_wide[bsize] * block_size_high[bsize];
+   const int num_blk = num_pix / 16;
+ 
++  // The chroma array sizes depend on chroma_ref_info, which normally lives
++  // inside the context. Derive it into a local first so the arena can be sized
++  // before anything is allocated, then copy it into the context.
++  CHROMA_REF_INFO chroma_ref_info;
++  set_chroma_ref_info(tree_type, mi_row, mi_col, index, bsize, &chroma_ref_info,
++                      parent ? &parent->chroma_ref_info : NULL,
++                      parent ? parent->block_size : BLOCK_INVALID,
++                      parent_partition, subsampling_x, subsampling_y);
++
+   // We need to get actual chroma block size due to possible sub-8x8 luma block
+   // sizes.
+-  const int num_pix_bize_base = get_num_pix_bsize_base(
+-      bsize, tree_type, &ctx->chroma_ref_info, num_planes);
++  const int num_pix_bize_base =
++      get_num_pix_bsize_base(bsize, tree_type, &chroma_ref_info, num_planes);
++  const int num_blk_chroma = num_pix_bize_base / 16;
++  const int has_palette_bufs = num_pix <= MAX_PALETTE_SQUARE;
++
++  // Lay out the arena. The context struct comes first so that its address is
++  // also the address of the whole allocation, which is what av2_free_pmc()
++  // releases.
++  size_t arena_size = 0;
++  const size_t off_ctx = pmc_arena_reserve(&arena_size, sizeof(PICK_MODE_CONTEXT));
++  const size_t off_tx_type_map =
++      pmc_arena_reserve(&arena_size, num_blk * sizeof(TX_TYPE));
++  const size_t off_cctx_type_map =
++      pmc_arena_reserve(&arena_size, num_blk_chroma * sizeof(CctxType));
++  size_t off_blk_skip[MAX_MB_PLANE] = { 0 };
++  size_t off_eobs[MAX_MB_PLANE] = { 0 };
++  size_t off_bobs[MAX_MB_PLANE] = { 0 };
++  size_t off_txb_ctx[MAX_MB_PLANE] = { 0 };
++  for (int i = 0; i < num_planes; ++i) {
++    const int num_blk_plane = (i == 0) ? num_blk : num_blk_chroma;
++    off_blk_skip[i] = pmc_arena_reserve(&arena_size, num_blk_plane);
++    off_eobs[i] =
++        pmc_arena_reserve(&arena_size, num_blk_plane * sizeof(uint16_t));
++    off_bobs[i] =
++        pmc_arena_reserve(&arena_size, num_blk_plane * sizeof(uint16_t));
++    off_txb_ctx[i] = pmc_arena_reserve(&arena_size, num_blk_plane);
++  }
++  size_t off_color_map[2] = { 0, 0 };
++  if (has_palette_bufs) {
++    for (int i = 0; i < 2; ++i) {
++      const int color_map_size = (i == 0) ? num_pix : num_pix_bize_base;
++      off_color_map[i] = pmc_arena_reserve(&arena_size, color_map_size);
++    }
++  }
++
++  uint8_t *arena = NULL;
++  AVM_CHECK_MEM_ERROR(&error, arena, avm_memalign(PMC_ARENA_ALIGN, arena_size));
++  assert(off_ctx == 0);
++  PICK_MODE_CONTEXT *const ctx = (PICK_MODE_CONTEXT *)(arena + off_ctx);
++
++  // Reproduce exactly the zero initialisation the previous per-array
++  // allocations provided: the context, tx_type_map, cctx_type_map and blk_skip
++  // came from avm_calloc(); eobs, bobs, txb_entropy_ctx and color_index_map
++  // came from avm_memalign() and were left uninitialised.
++  memset(ctx, 0, sizeof(*ctx));
++  ctx->rd_mode_is_ready = 0;
++  ctx->parent = parent;
++  ctx->index = index;
++  ctx->chroma_ref_info = chroma_ref_info;
++  ctx->mic.chroma_ref_info = ctx->chroma_ref_info;
+   ctx->num_4x4_blk = num_blk;
+-  ctx->num_4x4_blk_chroma = num_pix_bize_base / 16;
++  ctx->num_4x4_blk_chroma = num_blk_chroma;
+ 
+-  AVM_CHECK_MEM_ERROR(&error, ctx->tx_type_map,
+-                      avm_calloc(num_blk, sizeof(*ctx->tx_type_map)));
+-  AVM_CHECK_MEM_ERROR(
+-      &error, ctx->cctx_type_map,
+-      avm_calloc(ctx->num_4x4_blk_chroma, sizeof(*ctx->cctx_type_map)));
++  ctx->tx_type_map = (TX_TYPE *)(arena + off_tx_type_map);
++  memset(ctx->tx_type_map, 0, num_blk * sizeof(*ctx->tx_type_map));
++  ctx->cctx_type_map = (CctxType *)(arena + off_cctx_type_map);
++  memset(ctx->cctx_type_map, 0, num_blk_chroma * sizeof(*ctx->cctx_type_map));
+ 
+   for (int i = 0; i < num_planes; ++i) {
+     ctx->coeff[i] = shared_bufs->coeff_buf[i];
+     ctx->qcoeff[i] = shared_bufs->qcoeff_buf[i];
+     ctx->dqcoeff[i] = shared_bufs->dqcoeff_buf[i];
+-    const int num_blk_plane =
+-        (i == 0) ? ctx->num_4x4_blk : ctx->num_4x4_blk_chroma;
+-    AVM_CHECK_MEM_ERROR(&error, ctx->blk_skip[i],
+-                        avm_calloc(num_blk_plane, sizeof(*ctx->blk_skip[i])));
+-    AVM_CHECK_MEM_ERROR(
+-        &error, ctx->eobs[i],
+-        avm_memalign(32, num_blk_plane * sizeof(*ctx->eobs[i])));
+-    AVM_CHECK_MEM_ERROR(
+-        &error, ctx->bobs[i],
+-        avm_memalign(32, num_blk_plane * sizeof(*ctx->bobs[i])));
+-    AVM_CHECK_MEM_ERROR(
+-        &error, ctx->txb_entropy_ctx[i],
+-        avm_memalign(32, num_blk_plane * sizeof(*ctx->txb_entropy_ctx[i])));
++    const int num_blk_plane = (i == 0) ? num_blk : num_blk_chroma;
++    ctx->blk_skip[i] = arena + off_blk_skip[i];
++    memset(ctx->blk_skip[i], 0, num_blk_plane * sizeof(*ctx->blk_skip[i]));
++    ctx->eobs[i] = (uint16_t *)(arena + off_eobs[i]);
++    ctx->bobs[i] = (uint16_t *)(arena + off_bobs[i]);
++    ctx->txb_entropy_ctx[i] = arena + off_txb_ctx[i];
+   }
+ 
+-  if (num_pix <= MAX_PALETTE_SQUARE) {
++  if (has_palette_bufs) {
+     for (int i = 0; i < 2; ++i) {
+-      const int color_map_size = (i == 0) ? num_pix : num_pix_bize_base;
+-      AVM_CHECK_MEM_ERROR(
+-          &error, ctx->color_index_map[i],
+-          avm_memalign(32, color_map_size * sizeof(*ctx->color_index_map[i])));
++      ctx->color_index_map[i] = arena + off_color_map[i];
+     }
+   }
+   av2_invalid_rd_stats(&ctx->rd_stats);
+@@ -202,32 +259,9 @@ PICK_MODE_CONTEXT *av2_alloc_pmc(const AV2_COMMON *cm, TREE_TYPE tree_type,
+ 
+ void av2_free_pmc(PICK_MODE_CONTEXT *ctx, int num_planes) {
+   if (ctx == NULL) return;
+-
+-  for (int i = 0; i < MAX_MB_PLANE; ++i) {
+-    avm_free(ctx->blk_skip[i]);
+-    ctx->blk_skip[i] = NULL;
+-  }
+-  avm_free(ctx->tx_type_map);
+-  ctx->tx_type_map = NULL;
+-  avm_free(ctx->cctx_type_map);
+-  ctx->cctx_type_map = NULL;
+-  for (int i = 0; i < num_planes; ++i) {
+-    ctx->coeff[i] = NULL;
+-    ctx->qcoeff[i] = NULL;
+-    ctx->dqcoeff[i] = NULL;
+-    avm_free(ctx->eobs[i]);
+-    ctx->eobs[i] = NULL;
+-    avm_free(ctx->bobs[i]);
+-    ctx->bobs[i] = NULL;
+-    avm_free(ctx->txb_entropy_ctx[i]);
+-    ctx->txb_entropy_ctx[i] = NULL;
+-  }
+-
+-  for (int i = 0; i < 2; ++i) {
+-    avm_free(ctx->color_index_map[i]);
+-    ctx->color_index_map[i] = NULL;
+-  }
+-
++  (void)num_planes;
++  // The context and every array it owns live in one arena that starts at `ctx`,
++  // so a single free releases all of it.
+   avm_free(ctx);
+ }
+ 

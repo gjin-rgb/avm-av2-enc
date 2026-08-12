@@ -1,0 +1,174 @@
+diff --git a/av2/encoder/block.h b/av2/encoder/block.h
+index 13157d2..1b954a9 100644
+--- a/av2/encoder/block.h
++++ b/av2/encoder/block.h
+@@ -128,6 +128,20 @@ typedef struct macroblock_plane {
+   DECLARE_ALIGNED(32, int16_t, src_diff[MAX_SB_SQUARE]);
+   //! Temporary buffer for primary transform coeffs
+   DECLARE_ALIGNED(32, int32_t, temp_coeff[4096]);
++  /*! \name Forward secondary transform (IST) coefficient buffer state
++   *
++   * Describes what the last forward secondary transform left in the coeff
++   * buffer, so that the next IST candidate for the same transform block can
++   * clear just the few positions it owns instead of wiping the whole block.
++   */
++  /**@{*/
++  //! Primary scan order of the retained positions, NULL if coeff is dense.
++  const int16_t *stx_retained_scan;
++  //! Number of leading scan positions currently holding IST output.
++  int stx_retained_num;
++  //! Coefficient block offset that the retained state describes.
++  int stx_retained_offset;
++  /**@}*/
+   //! Dequantized coefficients
+   tran_low_t *dqcoeff;
+   //! Quantized coefficients
+diff --git a/av2/encoder/encodemb.c b/av2/encoder/encodemb.c
+index fc9e00a..86b1df7 100644
+--- a/av2/encoder/encodemb.c
++++ b/av2/encoder/encodemb.c
+@@ -585,11 +585,14 @@ static AV2_QUANT_FACADE quant_func_list[AV2_XFORM_QUANT_TYPES] = {
+ void av2_xform_dc_only(MACROBLOCK *x, int plane, int block,
+                        TxfmParam *txfm_param, int64_t per_px_mean) {
+   assert(per_px_mean != INT64_MAX);
+-  const struct macroblock_plane *const p = &x->plane[plane];
++  struct macroblock_plane *const p = &x->plane[plane];
+   const int block_offset = BLOCK_OFFSET(block);
+   tran_low_t *const coeff = p->coeff + block_offset;
+   const int n_coeffs = av2_get_max_eob(txfm_param->tx_size);
+   memset(coeff, 0, sizeof(*coeff) * n_coeffs);
++  // The block was rewritten from scratch here, so any retained secondary
++  // transform state for it is stale.
++  p->stx_retained_scan = NULL;
+   coeff[0] =
+       (tran_low_t)((per_px_mean * dc_coeff_scale[txfm_param->tx_size]) >> 12);
+ }
+@@ -645,8 +648,15 @@ void av2_xform(MACROBLOCK *x, int plane, int block, int blk_row, int blk_col,
+   const int src_offset = (blk_row * diff_stride + blk_col);
+   const int16_t *src_diff = &p->src_diff[src_offset << MI_SIZE_LOG2];
+ 
++  // Input the forward secondary transform reads its primary coefficients from,
++  // and the running description of what the previous secondary transform left
++  // in `coeff`. See av2_fwd_stxfm().
++  const tran_low_t *primary_src = NULL;
++  int *retained = NULL;
++
+   if (reuse == 0) {
+     av2_fwd_txfm(src_diff, coeff, diff_stride, txfm_param);
++    p->stx_retained_scan = NULL;
+   } else {
+     const int tr_width = tx_size_wide[txfm_param->tx_size] <= 32
+                              ? tx_size_wide[txfm_param->tx_size]
+@@ -663,9 +673,25 @@ void av2_xform(MACROBLOCK *x, int plane, int block, int blk_row, int blk_col,
+       if (plane == 0) {
+         memcpy(p->temp_coeff, coeff, tr_width * tr_height * sizeof(tran_low_t));
+       }
++      // `coeff` now holds a dense primary block.
++      p->stx_retained_scan = NULL;
++    } else if (plane == 0 && txfm_param->sec_tx_type != 0) {
++      // The secondary transform gathers a few primary coefficients and then
++      // overwrites the whole block, so restoring the primary block into
++      // `coeff` first is pure waste: point the transform at the saved copy
++      // instead and let it rewrite only the positions it owns.
++      primary_src = (const tran_low_t *)p->temp_coeff;
++      const int16_t *const scan =
++          get_scan(txfm_param->tx_size, txfm_param->tx_type)->scan;
++      if (p->stx_retained_scan != scan || p->stx_retained_offset != block_offset)
++        p->stx_retained_num = 0;
++      p->stx_retained_scan = scan;
++      p->stx_retained_offset = block_offset;
++      retained = &p->stx_retained_num;
+     } else {
+       if (plane == 0)
+         memcpy(coeff, p->temp_coeff, tr_width * tr_height * sizeof(tran_low_t));
++      p->stx_retained_scan = NULL;
+     }
+   }
+   MACROBLOCKD *const xd = &x->e_mbd;
+@@ -674,7 +700,7 @@ void av2_xform(MACROBLOCK *x, int plane, int block, int blk_row, int blk_col,
+   if (!is_inter_block(mbmi, xd->tree_type))
+     assert((intra_mode >= PAETH_PRED && txfm_param->sec_tx_type) == 0);
+   (void)intra_mode;
+-  av2_fwd_stxfm(coeff, txfm_param, sec_tx_sse);
++  av2_fwd_stxfm(coeff, primary_src, retained, txfm_param, sec_tx_sse);
+ }
+ 
+ // Facade function for forward cross chroma component transform
+diff --git a/av2/encoder/hybrid_fwd_txfm.c b/av2/encoder/hybrid_fwd_txfm.c
+index 357c73b..3282e1a 100644
+--- a/av2/encoder/hybrid_fwd_txfm.c
++++ b/av2/encoder/hybrid_fwd_txfm.c
+@@ -1051,7 +1051,8 @@ void av2_fwd_cross_chroma_tx_block_c(tran_low_t *coeff_c1, tran_low_t *coeff_c2,
+   }
+ }
+ 
+-void av2_fwd_stxfm(tran_low_t *coeff, TxfmParam *txfm_param,
++void av2_fwd_stxfm(tran_low_t *coeff, const tran_low_t *primary_coeff,
++                   int *num_retained, TxfmParam *txfm_param,
+                    int64_t *sec_tx_sse) {
+   const TX_TYPE stx_type = txfm_param->sec_tx_type;
+ 
+@@ -1075,7 +1076,9 @@ void av2_fwd_stxfm(tran_low_t *coeff, TxfmParam *txfm_param,
+     const int16_t *const scan = scan_order_out->scan;
+     tran_low_t buf0[64] = { 0 }, buf1[64] = { 0 };
+     tran_low_t *tmp = buf0;
+-    tran_low_t *src = coeff;
++    // The primary coefficients may live in a caller owned copy, which avoids
++    // restoring them into `coeff` only for this gather to read a few of them.
++    const tran_low_t *src = (primary_coeff != NULL) ? primary_coeff : coeff;
+     int8_t transpose = 0;
+     mode = AVMMIN(intra_mode, SMOOTH_H_PRED);
+     if ((mode == H_PRED) || (mode == D157_PRED) || (mode == D67_PRED) ||
+@@ -1141,12 +1144,24 @@ void av2_fwd_stxfm(tran_low_t *coeff, TxfmParam *txfm_param,
+       sec_tx_coeff_energy = RIGHT_SIGNED_SHIFT(sec_tx_coeff_energy, tx_shift);
+       *sec_tx_sse = sec_tx_coeff_energy;
+     }
+-    memset(coeff, 0, width * height * sizeof(tran_low_t));
++    // The secondary transform discards every primary coefficient outside the
++    // reduced set, so `coeff` ends up zero apart from the first reduced_width
++    // scan positions. When the previous candidate already left the block in
++    // that state there is nothing dense left to wipe: clearing the handful of
++    // positions it wrote is enough, and the full width*height clear (up to 4kB
++    // per candidate, repeated for every IST set and kernel) can be skipped.
++    const int prev_retained = (num_retained != NULL) ? *num_retained : 0;
++    if (prev_retained <= 0) {
++      memset(coeff, 0, width * height * sizeof(tran_low_t));
++    } else {
++      for (int i = 0; i < prev_retained; i++) coeff[scan[i]] = 0;
++    }
+     tmp = buf1;
+     for (int i = 0; i < reduced_width; i++) {
+       // Align scan order of IST with primary transform scan order
+       coeff[scan[i]] = *tmp++;
+     }
++    if (num_retained != NULL) *num_retained = reduced_width;
+ #if STX_COEFF_DEBUG
+     fprintf(stderr, "(stx coeff)\n");
+     for (int i = 0; i < height; i++) {
+diff --git a/av2/encoder/hybrid_fwd_txfm.h b/av2/encoder/hybrid_fwd_txfm.h
+index bf3df47..aa32b8e 100644
+--- a/av2/encoder/hybrid_fwd_txfm.h
++++ b/av2/encoder/hybrid_fwd_txfm.h
+@@ -22,7 +22,21 @@ extern "C" {
+ void av2_fwd_txfm(const int16_t *src_diff, tran_low_t *coeff, int diff_stride,
+                   TxfmParam *txfm_param);
+ 
+-void av2_fwd_stxfm(tran_low_t *coeff, TxfmParam *txfm_param,
++// Applies the forward secondary transform (IST) in place on `coeff`.
++//
++// `primary_coeff`, when non-NULL, is an external copy of the primary transform
++// coefficients that the secondary transform reads its input from. This lets the
++// caller keep one saved copy of the primary block instead of restoring it into
++// `coeff` before every secondary transform candidate.
++//
++// The secondary transform leaves `coeff` zero everywhere except at the first
++// `*num_retained` positions of the primary scan order. `*num_retained` is an
++// in/out parameter: on input it tells how many leading scan positions the
++// previous call left non-zero (0 when `coeff` holds a dense block and therefore
++// needs a full clear), on output it is set to the count this call wrote. Pass
++// NULL to always clear the whole block.
++void av2_fwd_stxfm(tran_low_t *coeff, const tran_low_t *primary_coeff,
++                   int *num_retained, TxfmParam *txfm_param,
+                    int64_t *sec_tx_sse);
+ 
+ #ifdef __cplusplus

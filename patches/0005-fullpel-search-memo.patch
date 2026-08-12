@@ -1,0 +1,311 @@
+diff --git a/av2/encoder/block.h b/av2/encoder/block.h
+index 13157d2..6a05467 100644
+--- a/av2/encoder/block.h
++++ b/av2/encoder/block.h
+@@ -1313,6 +1313,63 @@ struct inter_modes_info;
+  * decoder's view of the current block, the txfm coefficients. This struct also
+  * contains various buffers and data used to speed up the encoding process.
+  */
++/*! Number of full pixel motion search results memoised per block. */
++#define FULLPEL_MEMO_ENTRIES 8
++
++/*! \brief Complete description of one full pixel motion search problem.
++ *
++ * Every input that can change the outcome of av2_full_pixel_search() while the
++ * encoder stays on the same block is captured here, so that two searches with
++ * equal keys are guaranteed to produce equal results. The source and reference
++ * buffer pointers stand in for the block position and the reference frame, and
++ * the search range limits stand in for the block geometry.
++ */
++typedef struct {
++  const uint16_t *src_buf;  /*!< Source block pointer. */
++  const uint16_t *ref_buf;  /*!< Reference block pointer. */
++  int src_stride;           /*!< Source stride. */
++  int ref_stride;           /*!< Reference stride. */
++  FullMvLimits mv_limits;   /*!< Full pel search limits of the block. */
++  int32_t ref_mv;           /*!< Predictor the MV rate is measured against. */
++  int32_t start_mv;         /*!< Full pel starting point of the search. */
++  int32_t step_param;       /*!< Coarsest step of the step search. */
++  int32_t opfl_iterations;  /*!< Optical flow refinement iterations. */
++  uint8_t bsize;            /*!< Block size. */
++  uint8_t precision;        /*!< MV precision the search runs at. */
++  uint8_t motion_mode;      /*!< Motion mode driving the search. */
++  uint8_t adaptive_mvd;     /*!< Adaptive MVD resolution flag. */
++} FullpelSearchKey;
++
++/*! \brief One memoised full pixel motion search result. */
++typedef struct {
++  FullpelSearchKey key;      /*!< Search problem this result belongs to. */
++  FULLPEL_MV best_mv;        /*!< Winning full pel MV. */
++  FULLPEL_MV second_best_mv; /*!< Runner up, seeds the sub pel search. */
++  int best_err;              /*!< Error of the winning MV. */
++  int cost_list[5];          /*!< Neighbourhood costs for the sub pel search. */
++  int valid;                 /*!< Whether this slot holds a result. */
++} FullpelSearchMemoEntry;
++
++/*! \brief Small direct mapped memo of the block's full pixel motion searches.
++ *
++ * A single inter mode is evaluated repeatedly for the same block: across DRL
++ * indices, MV precisions, BAWP on/off and refined-MV on/off. Many of those
++ * iterations pose the very same full pixel search problem, which is by far the
++ * most expensive part of evaluating them. Remembering the results within the
++ * block turns those repeats into lookups. The stamp fields bound the memo to
++ * one block so stale entries can never be hit.
++ */
++typedef struct {
++  int mi_row;      /*!< Row of the block the memo belongs to. */
++  int mi_col;      /*!< Column of the block the memo belongs to. */
++  int bsize;       /*!< Size of the block the memo belongs to. */
++  uint32_t stamp;  /*!< FULLPEL_MEMO_STAMP once the fields above are valid. */
++  FullpelSearchMemoEntry entries[FULLPEL_MEMO_ENTRIES]; /*!< Memo slots. */
++} FullpelSearchMemo;
++
++/*! Marks a FullpelSearchMemo whose block stamp has been initialised. */
++#define FULLPEL_MEMO_STAMP 0x9e3779b9u
++
+ typedef struct macroblock {
+   /*****************************************************************************
+    * \name Source, Buffers and Decoder
+@@ -1647,6 +1704,8 @@ typedef struct macroblock {
+   MB_MODE_INFO *inter_mode_cache[NUMBER_OF_CACHED_MODES];
+   /*! \brief Whether the whole superblock is inside the frame boudnary */
+   bool is_whole_sb;
++  /*! \brief Memo of full pixel motion searches done for the current block. */
++  FullpelSearchMemo fullpel_memo;
+   /**@}*/
+ 
+   /*! \brief Quantization state of a transform coefficient.
+diff --git a/av2/encoder/motion_search_facade.c b/av2/encoder/motion_search_facade.c
+index 905a06f..638c993 100644
+--- a/av2/encoder/motion_search_facade.c
++++ b/av2/encoder/motion_search_facade.c
+@@ -41,6 +41,45 @@ static int compare_weight(const void *a, const void *b) {
+ }
+ 
+ // Allow more mesh searches for screen content type on the ARF.
++// FNV-1a over the raw bytes of a search key. The key is always memset before
++// being filled in, so padding bytes are deterministic.
++static INLINE uint32_t fullpel_key_hash(const FullpelSearchKey *key) {
++  const uint8_t *const bytes = (const uint8_t *)key;
++  uint32_t hash = 2166136261u;
++  for (size_t i = 0; i < sizeof(*key); ++i) {
++    hash ^= bytes[i];
++    hash *= 16777619u;
++  }
++  return hash;
++}
++
++// Finds the memo slot for a full pixel search problem on the current block.
++//
++// The memo is rebound to the block on first use, so entries recorded while
++// encoding a different block, a different segment or a different frame can
++// never be consulted. Within a block a slot is only reported as a hit when the
++// whole key matches, which makes a hit an exact substitute for re-running the
++// search rather than an approximation of it. On a miss the returned slot is the
++// one the caller should fill in once it has the result.
++static FullpelSearchMemoEntry *fullpel_memo_slot(MACROBLOCK *x, int mi_row,
++                                                 int mi_col, BLOCK_SIZE bsize,
++                                                 const FullpelSearchKey *key,
++                                                 int *hit) {
++  FullpelSearchMemo *const memo = &x->fullpel_memo;
++  if (memo->stamp != FULLPEL_MEMO_STAMP || memo->mi_row != mi_row ||
++      memo->mi_col != mi_col || memo->bsize != (int)bsize) {
++    memset(memo->entries, 0, sizeof(memo->entries));
++    memo->mi_row = mi_row;
++    memo->mi_col = mi_col;
++    memo->bsize = (int)bsize;
++    memo->stamp = FULLPEL_MEMO_STAMP;
++  }
++  FullpelSearchMemoEntry *const entry =
++      &memo->entries[fullpel_key_hash(key) & (FULLPEL_MEMO_ENTRIES - 1)];
++  *hit = entry->valid && !memcmp(&entry->key, key, sizeof(*key));
++  return entry;
++}
++
+ static int use_fine_search_interval(const AV2_COMP *const cpi) {
+   return cpi->is_screen_content_type &&
+          (cpi->gf_group.update_type[cpi->gf_group.index] == ARF_UPDATE ||
+@@ -222,77 +261,119 @@ void av2_single_motion_search(const AV2_COMP *const cpi, MACROBLOCK *x,
+   const MvSubpelPrecision pb_mv_precision = mbmi->pb_mv_precision;
+   const int is_ibc_cost = 0;
+ 
+-  FULLPEL_MOTION_SEARCH_PARAMS full_ms_params;
+-  av2_make_default_fullpel_ms_params(&full_ms_params, cpi, x, bsize, &ref_mv,
+-                                     pb_mv_precision, is_ibc_cost,
+-                                     src_search_sites, fine_search_interval);
++  // Describe this full pixel search problem and look for a result recorded
++  // earlier on this block. The same inter mode is evaluated over and over for
++  // one block - across DRL indices, MV precisions, BAWP on/off and refined-MV
++  // on/off - and many of those iterations reduce to an identical full pixel
++  // search, which dominates their cost.
++  FullpelSearchKey ms_key;
++  memset(&ms_key, 0, sizeof(ms_key));
++  ms_key.src_buf = x->plane[0].src.buf;
++  ms_key.src_stride = x->plane[0].src.stride;
++  ms_key.ref_buf = xd->plane[0].pre[0].buf;
++  ms_key.ref_stride = xd->plane[0].pre[0].stride;
++  ms_key.mv_limits = x->mv_limits;
++  ms_key.ref_mv = ((int32_t)ref_mv.row << 16) | (uint16_t)ref_mv.col;
++  ms_key.start_mv = ((int32_t)start_mv.row << 16) | (uint16_t)start_mv.col;
++  ms_key.step_param = step_param;
++  ms_key.opfl_iterations = opfl_its;
++  ms_key.bsize = (uint8_t)bsize;
++  ms_key.precision = (uint8_t)pb_mv_precision;
++  ms_key.motion_mode = (uint8_t)mbmi->motion_mode;
++  ms_key.adaptive_mvd = (uint8_t)is_adaptive_mvd;
++
++  int memo_hit = 0;
++  FullpelSearchMemoEntry *const memo_entry =
++      fullpel_memo_slot(x, mi_row, mi_col, bsize, &ms_key, &memo_hit);
++
++  if (memo_hit) {
++    bestsme = memo_entry->best_err;
++    best_mv->as_fullmv = memo_entry->best_mv;
++    second_best_mv.as_fullmv = memo_entry->second_best_mv;
++    memcpy(cost_list, memo_entry->cost_list, sizeof(cost_list));
++  } else {
++    FULLPEL_MOTION_SEARCH_PARAMS full_ms_params;
++    av2_make_default_fullpel_ms_params(&full_ms_params, cpi, x, bsize, &ref_mv,
++                                       pb_mv_precision, is_ibc_cost,
++                                       src_search_sites, fine_search_interval);
+ 
+-  switch (mbmi->motion_mode) {
+-    case SIMPLE_TRANSLATION: {
+-      int sum_weight = 0;
+-
+-      for (int m = 0; m < cnt; m++) {
+-        FULLPEL_MV smv = cand[m].fmv;
+-        FULLPEL_MV this_best_mv, this_second_best_mv;
+-
+-        this_best_mv = smv;
+-        best_opfl_sme = INT_MAX;
+-        int term = 0;
+-        for (int it = 0; it < 1 + opfl_its; it++) {
+-          if (it > 0) {
+-            smv = this_best_mv;
+-            FULLPEL_MV prev_smv = smv;
+-            MV prev_mv = get_mv_from_fullmv(&prev_smv);
+-            cur_mv.as_mv = prev_mv;
+-            term = opfl_refine_fullpel_mv_one_sided(cm, xd, &full_ms_params,
+-                                                    mbmi, &smv, &cur_mv, bsize);
+-            if (term) break;
+-
+-            FULLPEL_MV cur_fullmv = get_fullmv_from_mv(&cur_mv.as_mv);
+-            full_pel_lower_mv_precision(&cur_fullmv, mbmi->pb_mv_precision);
+-
+-            // If MV delta is so small that full pel MV local search is likely
+-            // to cover this delta, then up scale this delta. For delta being
+-            // (0,0), apply (1,-1)*big_step here.
+-            if (abs(cur_fullmv.row - prev_smv.row) <= range_thr &&
+-                abs(cur_fullmv.col - prev_smv.col) <= range_thr) {
+-              smv.row += cur_mv.as_mv.row >= prev_mv.row ? step : -step;
+-              smv.col += cur_mv.as_mv.col > prev_mv.col ? step : -step;
++    switch (mbmi->motion_mode) {
++      case SIMPLE_TRANSLATION: {
++        int sum_weight = 0;
++
++        for (int m = 0; m < cnt; m++) {
++          FULLPEL_MV smv = cand[m].fmv;
++          FULLPEL_MV this_best_mv, this_second_best_mv;
++
++          this_best_mv = smv;
++          best_opfl_sme = INT_MAX;
++          int term = 0;
++          for (int it = 0; it < 1 + opfl_its; it++) {
++            if (it > 0) {
++              smv = this_best_mv;
++              FULLPEL_MV prev_smv = smv;
++              MV prev_mv = get_mv_from_fullmv(&prev_smv);
++              cur_mv.as_mv = prev_mv;
++              term = opfl_refine_fullpel_mv_one_sided(cm, xd, &full_ms_params,
++                                                      mbmi, &smv, &cur_mv, bsize);
++              if (term) break;
++
++              FULLPEL_MV cur_fullmv = get_fullmv_from_mv(&cur_mv.as_mv);
++              full_pel_lower_mv_precision(&cur_fullmv, mbmi->pb_mv_precision);
++
++              // If MV delta is so small that full pel MV local search is likely
++              // to cover this delta, then up scale this delta. For delta being
++              // (0,0), apply (1,-1)*big_step here.
++              if (abs(cur_fullmv.row - prev_smv.row) <= range_thr &&
++                  abs(cur_fullmv.col - prev_smv.col) <= range_thr) {
++                smv.row += cur_mv.as_mv.row >= prev_mv.row ? step : -step;
++                smv.col += cur_mv.as_mv.col > prev_mv.col ? step : -step;
++              } else {
++                smv = cur_fullmv;
++              }
++            }
++
++            int thissme = av2_full_pixel_search(
++                smv, &full_ms_params, step_param, cond_cost_list(cpi, cost_list),
++                &this_best_mv, &this_second_best_mv);
++
++            full_pel_lower_mv_precision(&this_second_best_mv,
++                                        mbmi->pb_mv_precision);
++            assert(is_this_mv_precision_compliant(
++                get_mv_from_fullmv(&this_best_mv), pb_mv_precision));
++            assert(is_this_mv_precision_compliant(
++                get_mv_from_fullmv(&this_second_best_mv), pb_mv_precision));
++
++            if (thissme < best_opfl_sme) {
++              best_opfl_sme = thissme;
++              this_best_opfl_mv = this_best_mv;
++              this_second_best_opfl_mv = this_second_best_mv;
+             } else {
+-              smv = cur_fullmv;
++              break;
+             }
+           }
+-
+-          int thissme = av2_full_pixel_search(
+-              smv, &full_ms_params, step_param, cond_cost_list(cpi, cost_list),
+-              &this_best_mv, &this_second_best_mv);
+-
+-          full_pel_lower_mv_precision(&this_second_best_mv,
+-                                      mbmi->pb_mv_precision);
+-          assert(is_this_mv_precision_compliant(
+-              get_mv_from_fullmv(&this_best_mv), pb_mv_precision));
+-          assert(is_this_mv_precision_compliant(
+-              get_mv_from_fullmv(&this_second_best_mv), pb_mv_precision));
+-
+-          if (thissme < best_opfl_sme) {
+-            best_opfl_sme = thissme;
+-            this_best_opfl_mv = this_best_mv;
+-            this_second_best_opfl_mv = this_second_best_mv;
+-          } else {
+-            break;
++          if (best_opfl_sme < bestsme) {
++            bestsme = best_opfl_sme;
++            best_mv->as_fullmv = this_best_opfl_mv;
++            second_best_mv.as_fullmv = this_second_best_opfl_mv;
+           }
++
++          sum_weight += cand[m].weight;
++          if (m >= 2 || 4 * sum_weight > 3 * total_weight) break;
+         }
+-        if (best_opfl_sme < bestsme) {
+-          bestsme = best_opfl_sme;
+-          best_mv->as_fullmv = this_best_opfl_mv;
+-          second_best_mv.as_fullmv = this_second_best_opfl_mv;
+-        }
++      } break;
++      default: assert(0 && "Invalid motion mode!\n");
++    }
+ 
+-        sum_weight += cand[m].weight;
+-        if (m >= 2 || 4 * sum_weight > 3 * total_weight) break;
+-      }
+-    } break;
+-    default: assert(0 && "Invalid motion mode!\n");
++    // Record the outcome so that an identical search problem raised by another
++    // DRL index, MV precision or predictor variant of this block is answered
++    // from the memo.
++    memo_entry->key = ms_key;
++    memo_entry->best_mv = best_mv->as_fullmv;
++    memo_entry->second_best_mv = second_best_mv.as_fullmv;
++    memo_entry->best_err = bestsme;
++    memcpy(memo_entry->cost_list, cost_list, sizeof(memo_entry->cost_list));
++    memo_entry->valid = 1;
+   }
+ 
+   if (scaled_ref_frame) {
