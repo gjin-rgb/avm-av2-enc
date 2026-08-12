@@ -6,6 +6,31 @@ CTC slot rediscovering it.
 
 ---
 
+## 2026-08-12 — Tier-0 harness had a silent contamination bug (fixed)
+
+The first version of `bin/bitexact.sh` reverted the tree between patches with
+`git checkout -- av2/ aom/ 2>/dev/null`. This repo has no `aom/` directory — AVM
+renamed it `av2/` — so git rejected the entire command on the bad pathspec,
+reverted **nothing**, and returned 1, with the error swallowed by `2>/dev/null`.
+
+Consequence: patches accumulated instead of being tested in isolation. i03 would
+have been measured with i02 still applied, i05 with both, and on the following
+run the *baseline itself* was built with all three patches in the tree. The
+script would have printed confident, precisely formatted, entirely wrong
+signatures — and "bit-exact" would have been the expected output, since the
+baseline and the patched builds were becoming the same binary.
+
+Caught by noticing `git status` showed all three patches' files modified at once
+during what was supposed to be a clean baseline build. Fixed by reverting with a
+valid pathspec and then **asserting** the tree is clean, aborting loudly if not.
+
+This is the same failure mode as the round-1 measurements below: a number that
+looks precise, is produced by a process nobody verified, and is wrong. The
+general rule now applied in the tooling: *assert the state you depend on; never
+assume the command that was supposed to establish it worked.*
+
+---
+
 ## 2026-08-12 — Round-1 measurements audited and largely retracted
 
 **Trigger.** CTC round 1 (A1 17 frames, A2 33 frames, RA) was launched against

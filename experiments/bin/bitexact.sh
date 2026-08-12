@@ -54,7 +54,32 @@ ARGS="--verbose --codec=av2 -v --psnr --obu --frame-parallel=0 --threads=1 \
 --fps=$FPS/1 -w $WIDTH -h $HEIGHT --lag-in-frames=19 --auto-alt-ref=1 \
 --kf-max-dist=65"
 
-clean_tree() { git checkout -- av2/ aom/ 2>/dev/null; }
+# Revert the source tree, and then PROVE it reverted.
+#
+# The first version of this function was `git checkout -- av2/ aom/ 2>/dev/null`.
+# This repo has no aom/ directory (AVM renamed it av2/), so git rejected the
+# whole command on the bad pathspec, reverted nothing, and returned 1 -- while
+# the 2>/dev/null hid the error. Patches then accumulated across iterations:
+# i03 got measured with i02 still applied, i05 with both, and on the following
+# run the "baseline" itself was built with all three patches in the tree. The
+# script would have printed confident, precisely formatted, entirely wrong
+# signatures.
+#
+# The lesson generalizes beyond this script: an unverified cleanup step is not a
+# cleanup step. Assert the state you depend on instead of trusting that the
+# command meant to establish it did.
+#
+# Scoped to av2/ so that a run cannot revert edits to the tooling under
+# experiments/ while it executes.
+clean_tree() {
+  git checkout -- av2/ >>"$LOG" 2>&1
+  if ! git diff --quiet -- av2/ || ! git diff --cached --quiet -- av2/; then
+    echo "FATAL: av2/ still dirty after revert; refusing to continue." >&2
+    git diff --stat -- av2/ >&2
+    exit 2
+  fi
+}
+
 build_enc()  { make -C "$REPO/build" -j"$(nproc)" avmenc >>"$LOG" 2>&1; }
 
 encode_sig() {
