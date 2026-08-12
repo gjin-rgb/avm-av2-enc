@@ -9,10 +9,10 @@
 > t4_bdrate: full CTC RA BD-rate, overall. t4_worst: worst single sequence.
 id,name,mechanism,expect_bitexact,t0_bitexact,t1_instr_pct,t2_regret,t4_bdrate,t4_worst,t4_speedup,status,notes
 i01,tx-type RD saturation exit,approx,no,n/a,-,-,-,-,-,ctc-round-1-running,"round-1 wall clock 6.5% [2.9,10.0]; real but CI crosses the 5% bar"
-i02,IST sparse coeff restore,reuse,YES,-,-,n/a,n/a,n/a,-,tier-0-running,"round-1 1.3% = NOISE (floor 3.5%). Bit-exact check decides it, not CTC"
-i03,PICK_MODE_CONTEXT arena alloc,reuse,YES,-,-,n/a,n/a,n/a,-,tier-0-running,"round-1 1.2% = NOISE. Pure allocation refactor"
+i02,IST sparse coeff restore,reuse,YES,PASS,-,n/a,n/a,n/a,-,cleared-tier0,"BIT-EXACT. Zero quality risk on tested config; do NOT spend a CTC round. Speed still unmeasured (round-1 1.3% was below noise) -> needs Tier 1"
+i03,PICK_MODE_CONTEXT arena alloc,reuse,YES,PASS,-,n/a,n/a,n/a,-,cleared-tier0,"BIT-EXACT. Zero quality risk on tested config; do NOT spend a CTC round. Speed still unmeasured (round-1 1.2% was below noise) -> needs Tier 1"
 i04,sub-pel curvature gate,approx,no,n/a,-,-,-,-,-,hold,"round-1 0.5% = NOISE. Do not spend CTC until Tier 1 clears it"
-i05,full-pel search memoization,reuse,YES,-,-,n/a,n/a,n/a,-,tier-0-running,"round-1 1.2% = NOISE. A cache that changes output is a cache-key bug"
+i05,full-pel search memoization,reuse,YES,PASS,-,n/a,n/a,n/a,-,cleared-tier0,"BIT-EXACT: the memo key is correct across DRL index and MV precision on the tested config. Zero quality risk; do NOT spend a CTC round. Speed still unmeasured (round-1 1.2% was below noise) -> needs Tier 1"
 i06,ext-partition texture pruning,approx,no,n/a,-,-,-,-,-,ctc-round-1-running,"round-1 17.2% [14.3,20.2]; only unambiguous win. Also the highest BD-rate risk: partition pruning at 4K is where quality is lost"
 i07,RD-density partition termination,approx,no,n/a,-,-,-,-,-,ctc-round-1-running,"round-1 3.2% [0.2,6.1]; real but under the 5% bar"
 i08,DRL dispersion budget,approx,no,n/a,-,-,-,-,-,hold,"round-1 1.9% = NOISE"

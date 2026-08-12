@@ -6,6 +6,39 @@ CTC slot rediscovering it.
 
 ---
 
+## 2026-08-12 — Tier 0 result: i02, i03, i05 are all BIT-EXACT
+
+Run on the fixed harness (clean-tree assertion active, patches verified isolated
+one at a time):
+
+    config: 416x240, 6 frames, cpu-used=3, single-threaded, QP 110 and 185
+    baseline                          48ebfecfc46f8cb6a43277e7739b33a6
+    0002-ist-sparse-coeff-restore     48ebfecfc46f8cb6a43277e7739b33a6  BIT-EXACT
+    0003-pmc-arena-allocation         48ebfecfc46f8cb6a43277e7739b33a6  BIT-EXACT
+    0005-fullpel-search-memo          48ebfecfc46f8cb6a43277e7739b33a6  BIT-EXACT
+
+All three change no encode decision. For i05 specifically this says the memo key
+is correct across DRL index and MV precision — the exact thing that would have
+been wrong if the patch were buggy.
+
+**Decision: none of these three should consume a CTC round.** Their quality risk
+is zero on the tested configuration, which is a stronger and far cheaper result
+than a BD-rate table could give. What remains unknown for all three is *speed* —
+round-1 measured 1.3%, 1.2% and 1.2%, all below the 3.5% noise floor, so their
+benefit is still entirely unquantified. They go to Tier 1 (`perf stat`
+instruction counts), not to CTC.
+
+**Scope of the claim, stated precisely.** This is proof for the configuration
+tested, not a universal proof. One clip at 416x240, 6 frames, two QPs and
+cpu-used=3 does not exercise every block size, partition shape or reference
+structure that A1 4K at the CTC preset will. A cache-key bug living only in a
+path this config never reaches would not have been caught. Re-running Tier 0 on
+a 4K clip at the CTC preset before final sign-off is cheap and worth doing;
+until then the correct statement is "bit-exact on the tested configuration",
+not "bit-exact".
+
+---
+
 ## 2026-08-12 — Tier-0 harness had a silent contamination bug (fixed)
 
 The first version of `bin/bitexact.sh` reverted the tree between patches with
