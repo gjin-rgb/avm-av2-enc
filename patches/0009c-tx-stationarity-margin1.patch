@@ -1,0 +1,226 @@
+Patch 09c: transform partition stationarity, next step along the margin curve.
+Supersedes 09b (and 09) -- apply INSTEAD of either, never on top.
+
+09b passed on both classes at Speed 4 and improved on 09 in every dimension:
+
+    MARGIN 4 (patch 09)    A1 +2.60% / +0.11%  ratio 23.6
+                           A2 +2.27% / +0.09%  ratio 25.2
+    MARGIN 2 (patch 09b)   A1 +4.01% / +0.15%  ratio 26.7  PASS
+                           A2 +3.57% / +0.07%  ratio 51.0  PASS
+
+Two facts from that comparison drive this patch. Speed rose ~1.55x on both
+classes while BD-rate rose only 1.36x on A1 and *fell* on A2, so loosening was
+ratio-positive, not merely ratio-neutral. And A2's BD-rate of 0.07% is small
+enough to be indistinguishable from measurement noise, so its ratio of 51 is
+speed divided by noise and should not be read as 155% of genuine headroom.
+
+The single change here is TX_PART_STATIONARITY_MARGIN 2 -> 1, loosening the
+stationarity test from "strongest strip within 1.50x of mean" to "within
+2.00x".
+
+What this is and is not: two points trending favourably do not establish that
+the third does. A pruning threshold must decay as it loosens -- eventually
+every block is judged stationary and the quality cost runs away. This patch
+tests where that decay begins. A1 is the binding class, holding 33% headroom
+above the bar of 20 against A2's much larger margin, so A1 is where it will
+fail first if it fails.
+
+If it does, no patch edit is needed to recover: MARGIN 2 is measured and
+known-good, so build with -DTX_PART_STATIONARITY_MARGIN=2 and you are back to
+the 09b operating point exactly. Running 09c and 09b as two arms of the same
+round would bracket the curve and cost one extra arm.
+
+The lazy-evaluation change from 09b is unchanged and carried forward: the
+stationarity measurement stays deferred until after the cheap eligibility
+checks, and is skipped entirely when the only surviving candidate is
+TX_PARTITION_NONE.
+
+diff --git a/av2/encoder/tx_search.c b/av2/encoder/tx_search.c
+index 2af0748..2b47956 100644
+--- a/av2/encoder/tx_search.c
++++ b/av2/encoder/tx_search.c
+@@ -3145,6 +3145,137 @@ static AVM_INLINE int skip_tx_partition_by_eval_type(
+ }
+ 
+ // Search for the best tx partition type for a given luma block.
++// Number of strips the residual is divided into along each axis when testing
++// whether it is stationary.
++#ifndef TX_PART_STRIPS
++#define TX_PART_STRIPS 4
++#endif
++
++// The residual counts as stationary along an axis when its strongest strip
++// exceeds the average strip by at most 1/TX_PART_STATIONARITY_MARGIN, so the
++// strip energies must agree to within (1 + 1/MARGIN). Lower values are more
++// permissive and prune more:
++//
++//     MARGIN 4  ->  strongest strip <= 1.25x mean   (round 1)
++//     MARGIN 3  ->                     1.33x
++//     MARGIN 2  ->                     1.50x        (round 2)
++//     MARGIN 1  ->                     2.00x        (current default)
++//
++// Two measured points on this curve, both at Speed 4, and loosening was
++// ratio-positive at both:
++//
++//     MARGIN 4    A1 +2.60% / +0.11%  ratio 23.6    A2 +2.27% / +0.09%  25.2
++//     MARGIN 2    A1 +4.01% / +0.15%  ratio 26.7    A2 +3.57% / +0.07%  51.0
++//
++// Speed rose by ~1.55x on both classes while BD-rate rose only 1.36x on A1 and
++// actually fell on A2, so the ratio improved rather than decayed. A2's BD-rate
++// is now 0.07%, which is small enough to be indistinguishable from measurement
++// noise -- its ratio of 51 is really speed divided by noise and should not be
++// read as precise headroom.
++//
++// This default takes the next step to MARGIN 1. The honest position: two points
++// trending favourably do not establish that the third does, and a pruning
++// threshold must eventually decay as it loosens. A1 is the binding class, with
++// 33% of headroom above the bar of 20, so that is where this would fail first.
++// If it does, MARGIN 2 is the measured, known-good fallback and needs no patch
++// edit: build with -DTX_PART_STATIONARITY_MARGIN=2.
++#ifndef TX_PART_STATIONARITY_MARGIN
++#define TX_PART_STATIONARITY_MARGIN 1
++#endif
++
++// Tests whether the prediction residual of a transform block is stationary
++// along each axis.
++//
++// Splitting a transform block trades away the coding gain of one large
++// transform in exchange for describing the pieces separately, and pays the rate
++// of signalling the split on top. That trade can only pay off when the residual
++// is non stationary along the split axis: if its energy is spread evenly across
++// the block then every piece sees the same statistics the whole block did, so
++// the split gives up transform gain and buys nothing back.
++//
++// The residual is divided into TX_PART_STRIPS strips along each axis and the
++// strip energies are compared against their mean. Horizontal partitions cut the
++// block into strips stacked vertically, so they are governed by the variation
++// across rows, and vertical partitions by the variation across columns. The
++// measurement is subsampled on larger blocks, which costs a small fraction of a
++// single partition trial.
++static AVM_INLINE void measure_residual_stationarity(const MACROBLOCK *x,
++                                                     BLOCK_SIZE plane_bsize,
++                                                     int blk_row, int blk_col,
++                                                     TX_SIZE max_tx_size,
++                                                     int *stationary_rows,
++                                                     int *stationary_cols) {
++  *stationary_rows = 0;
++  *stationary_cols = 0;
++
++  const int txw = tx_size_wide[max_tx_size];
++  const int txh = tx_size_high[max_tx_size];
++  // Below two samples per strip the measurement is meaningless.
++  if (txw < TX_PART_STRIPS * 2 || txh < TX_PART_STRIPS * 2) return;
++
++  const struct macroblock_plane *const p = &x->plane[0];
++  const int diff_stride = block_size_wide[plane_bsize];
++  const int16_t *const diff =
++      &p->src_diff[(blk_row * diff_stride + blk_col) << MI_SIZE_LOG2];
++  const int step_y = txh >= 16 ? 2 : 1;
++  const int step_x = txw >= 16 ? 2 : 1;
++  const int strip_h = txh / TX_PART_STRIPS;
++  const int strip_w = txw / TX_PART_STRIPS;
++
++  uint64_t row_energy[TX_PART_STRIPS] = { 0 };
++  uint64_t col_energy[TX_PART_STRIPS] = { 0 };
++  uint64_t total = 0;
++
++  for (int i = 0; i < txh; i += step_y) {
++    const int16_t *const row = diff + (ptrdiff_t)i * diff_stride;
++    const int strip_i = AVMMIN(i / strip_h, TX_PART_STRIPS - 1);
++    for (int j = 0; j < txw; j += step_x) {
++      const uint64_t magnitude = (uint64_t)abs((int)row[j]);
++      row_energy[strip_i] += magnitude;
++      col_energy[AVMMIN(j / strip_w, TX_PART_STRIPS - 1)] += magnitude;
++      total += magnitude;
++    }
++  }
++  if (total == 0) {
++    // A residual that is identically zero is trivially stationary: no split can
++    // describe it any better than the whole block does.
++    *stationary_rows = 1;
++    *stationary_cols = 1;
++    return;
++  }
++
++  const uint64_t mean = total / TX_PART_STRIPS;
++  uint64_t max_row = 0;
++  uint64_t max_col = 0;
++  for (int s = 0; s < TX_PART_STRIPS; ++s) {
++    if (row_energy[s] > max_row) max_row = row_energy[s];
++    if (col_energy[s] > max_col) max_col = col_energy[s];
++  }
++
++  // max <= mean * (1 + 1/margin), written without division.
++  const uint64_t bound = mean * (TX_PART_STATIONARITY_MARGIN + 1);
++  *stationary_rows = (max_row * TX_PART_STATIONARITY_MARGIN <= bound);
++  *stationary_cols = (max_col * TX_PART_STATIONARITY_MARGIN <= bound);
++}
++
++// True when `type` cuts the block along an axis the residual is stationary on,
++// so that the split cannot describe the residual any better than
++// TX_PARTITION_NONE already does.
++static AVM_INLINE int tx_partition_cuts_stationary_axis(TX_PARTITION_TYPE type,
++                                                        int stationary_rows,
++                                                        int stationary_cols) {
++  switch (type) {
++    case TX_PARTITION_HORZ:
++    case TX_PARTITION_HORZ4:
++    case TX_PARTITION_HORZ5: return stationary_rows;
++    case TX_PARTITION_VERT:
++    case TX_PARTITION_VERT4:
++    case TX_PARTITION_VERT5: return stationary_cols;
++    case TX_PARTITION_SPLIT: return stationary_rows && stationary_cols;
++    default: return 0;
++  }
++}
++
+ static void select_tx_partition_type(
+     const AV2_COMP *cpi, MACROBLOCK *x, int blk_row, int blk_col, int block,
+     BLOCK_SIZE plane_bsize, ENTROPY_CONTEXT *ta, ENTROPY_CONTEXT *tl,
+@@ -3191,6 +3322,12 @@ static void select_tx_partition_type(
+   TX_TYPE best_partition_tx_types[MAX_TX_PARTITIONS] = { 0 };
+   uint8_t full_blk_skip[MAX_TX_PARTITIONS] = { 0 };
+ 
++  // Axes along which this block's residual carries no structure a split could
++  // exploit. Measured lazily -- see the call site below for why.
++  int stationary_rows = 0;
++  int stationary_cols = 0;
++  int stationarity_valid = 0;
++
+   for (TX_PARTITION_TYPE type = 0; type < TX_PARTITION_TYPES; ++type) {
+     if (cpi->common.seq_params.reduced_tx_part_set &&
+         type > TX_PARTITION_VERT) {
+@@ -3213,6 +3350,33 @@ static void select_tx_partition_type(
+       continue;
+     }
+ 
++    // The stationarity test goes last, and is computed on first use rather than
++    // up front.
++    //
++    // It is the only check in this loop that has to walk the residual, so
++    // paying it before the cheap tests above means paying it for candidates
++    // those tests were going to reject anyway -- and paying it on blocks where
++    // every split is rejected, so it can never fire. That overhead is the most
++    // likely explanation for this feature measuring -0.27% (a net slowdown) on
++    // 4K at Speed 3, where more blocks are visited and a larger share of them
++    // have their splits eliminated by other speed features first.
++    //
++    // TX_PARTITION_NONE is never dropped by the test, so a candidate always
++    // remains, and skipping the measurement for it means a block whose only
++    // surviving candidate is NONE pays nothing at all.
++    if (type != TX_PARTITION_NONE) {
++      if (!stationarity_valid) {
++        measure_residual_stationarity(x, plane_bsize, blk_row, blk_col,
++                                      max_tx_size, &stationary_rows,
++                                      &stationary_cols);
++        stationarity_valid = 1;
++      }
++      if (tx_partition_cuts_stationary_axis(type, stationary_rows,
++                                            stationary_cols)) {
++        continue;
++      }
++    }
++
+     if (cpi->sf.tx_sf.restrict_tx_partition_type_search) {
+       if ((type == TX_PARTITION_HORZ4 &&
+            best_tx_partition != TX_PARTITION_HORZ) ||

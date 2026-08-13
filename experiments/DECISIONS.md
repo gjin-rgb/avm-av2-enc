@@ -6,6 +6,81 @@ CTC slot rediscovering it.
 
 ---
 
+## 2026-08-13 — Round 2: 09b passes both classes; 06c improved A1 by the wrong mechanism
+
+Speed 4, anchor `d6b40b7893`, bar 20.
+
+    09b   A1 +4.01% / +0.15%  ratio 26.7  PASS     A2 +3.57% / +0.07%  51.0  PASS
+    06c   A1 +6.07% / +0.29%  ratio 20.9  PASS     A2 +6.21% / +0.46%  13.5  FAIL
+    both  A1 +11.87% / +0.54% ratio 22.0  PASS     A2 +9.80% / +0.72%  13.6  FAIL
+
+**09b is the first patch to clear the bar on both classes**, and it beat 09 on
+every axis: more speedup (+4.01% vs +2.60%) at a better ratio. Both of its
+changes worked. The lazy-evaluation fix was free as predicted, and loosening
+`TX_PART_STATIONARITY_MARGIN` 4 -> 2 was ratio-*positive* rather than merely
+ratio-neutral: speed rose ~1.55x on both classes while BD-rate rose only 1.36x
+on A1 and actually fell on A2.
+
+### 06c improved A1's ratio, but not by the mechanism it was built on
+
+    A1: speed -57%, BD -61%   ratio 18.7 -> 20.9
+    A2: speed -66%, BD -64%   ratio 14.4 -> 13.5   (worse)
+
+Both classes lost speed and quality cost in near-equal proportion. That is what
+a blunt reduction in pruning strength does, and it is precisely the failure mode
+the 06c commit message warned against before walking into it. On A2 it came out
+behind where it started.
+
+The detail that identifies the culprit: **A1's block-size floor never changed.**
+4K keeps a floor of 16 in both 06 and 06c, so the resolution scaling — the whole
+point of 06c — did nothing on A1. A1's entire -57% speedup came from the
+variance floor and the frame gate. The frame gate is the prime suspect, because
+it withheld pruning from frames low in the reference pyramid, which are the ones
+given the deepest search and therefore the most expensive.
+
+### 06d and 09c
+
+**`0009c`** — supersedes 09b. `TX_PART_STATIONARITY_MARGIN` 2 -> 1. Two measured
+points both trending favourably justify testing a third, but do not establish
+it: a pruning threshold must decay as it loosens. A1 binds, with 33% headroom.
+`-DTX_PART_STATIONARITY_MARGIN=2` restores the known-good 09b point without a
+patch edit, so 09b and 09c as two arms would bracket the curve.
+
+Note that A2's BD-rate of 0.07% is at the edge of measurement resolution, so its
+ratio of 51 is speed divided by noise and should not be read as real headroom.
+
+**`0006d`** — supersedes 06c. Two changes, both restoring speed that 06c gave up
+cheaply:
+
+1. *Frame gate removed.* Beyond its measured cost, the structural argument was
+   backwards: this heuristic profiles the **source** block, and source structure
+   drives partition choice most directly when no prediction has flattened it —
+   so the test is most trustworthy on intra frames, exactly the ones the gate
+   disabled it on. It was protecting the case the heuristic handles best.
+2. *Resolution floor relaxed for extended partitions only.* 06c raised one floor
+   for every partition type, but the patch already grades them by value —
+   rectangular partitions demand anisotropy 8, extended ones 4. The floor should
+   grade the same way. At 1080p rectangular partitions keep the floor of 32
+   while extended ones return to 16, restoring the cheaper half of the prunes
+   that 06c discarded wholesale. 4K is unaffected.
+
+**Risk to state plainly:** 06c *passes* on A1 at 20.9, and that margin is thin.
+If BD-rate returns faster than speed in 06d, it could fall below the bar on a
+class that currently clears it. 06c must stay in the round as a fallback arm.
+
+### A2 is the unsolved class, and threshold work will not solve it
+
+A2 has been ~30% worse than A1 in every variant: 18.7/14.4, then 20.9/13.5. That
+consistency across two very different parameter settings is not tuning error.
+The likeliest cause is the one flagged and not yet actioned: the profile is
+measured on the **source**, while A2 at 33 frames spends most of its blocks on
+inter prediction, where the *residual* decides whether a cut pays. A
+well-predicted block with strong source structure has a flat residual, and the
+heuristic cannot see that. If 06d does not move A2, the next step is a
+prediction-aware profile, not another threshold.
+
+---
+
 ## 2026-08-13 — Multi-speed data corrects two earlier conclusions; 06c and 09b
 
 Speeds 1-3 for patches 06 and 09 arrived. Two things in the earlier analysis

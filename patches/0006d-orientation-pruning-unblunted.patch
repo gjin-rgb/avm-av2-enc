@@ -1,0 +1,427 @@
+Patch 06d: orientation partition pruning, un-blunted. Supersedes 06, 06b and
+06c -- apply INSTEAD of any of them, never on top.
+
+06c did cut BD-rate substantially, but reading the two classes together shows
+it did so by the wrong mechanism:
+
+    06   A1 +14.00% / +0.75%  ratio 18.7    A2 +18.52% / +1.29%  ratio 14.4
+    06c  A1  +6.07% / +0.29%  ratio 20.9    A2  +6.21% / +0.46%  ratio 13.5
+
+    A1: speed -57%, BD -61%   ratio 18.7 -> 20.9
+    A2: speed -66%, BD -64%   ratio 14.4 -> 13.5  (WORSE)
+
+Both classes lost speed and quality cost in near-equal proportion, which is
+what a blunt reduction in pruning strength does. A ratio only moves when a
+change removes prunes that are expensive in quality and cheap in speed. 06c
+mostly just pruned less of everything, and on A2 it came out behind.
+
+The decisive detail is that A1's block-size floor never changed -- 4K keeps a
+floor of 16 in both 06 and 06c -- so A1's entire -57% speedup came from the
+variance floor and the frame gate, not from the resolution scaling that was the
+point of 06c.
+
+Two changes, both aimed at restoring speed that was surrendered cheaply.
+
+1. The frame gate is removed.
+
+   Measured: it withheld pruning from frames low in the reference pyramid,
+   which are exactly the frames given the deepest search and therefore the most
+   expensive. It gave up speedup where speedup was most available.
+
+   Structural, and the part I should have seen when writing 06b: this heuristic
+   profiles the SOURCE block. Source structure drives the partition choice most
+   directly when there is no prediction to flatten it, so the test is at its
+   most trustworthy on intra frames -- the very frames the gate disabled it on.
+   It was protecting the case the heuristic handles best.
+
+2. The resolution floor is relaxed for extended partitions only.
+
+   06c raised one floor for every partition type. But the patch already grades
+   partitions by value: plain rectangular partitions demand anisotropy 8 before
+   being dropped, extended ones only 4, because rectangular partitions carry far
+   more of the coding gain. The block-size floor should grade the same way.
+
+   So at 1080p the rectangular partitions keep the protective floor of 32 while
+   extended partitions return to 16, restoring pruning on 16x16..31x31 blocks.
+   Those prunes are the cheaper half in quality terms, and 06c discarded them
+   together with the expensive ones. 4K is unaffected: both floors are 16 there.
+
+The variance floor is unchanged and carried forward.
+
+Expected direction: more speedup than 06c on both classes, and more BD-rate
+too. The bet is that speed returns faster than quality cost does, because both
+changes restore prunes that were cheap in quality -- extended partitions, and
+intra frames where the source profile is most valid.
+
+The risk is specific and worth stating: 06c PASSES on A1 at ratio 20.9, and
+that margin is thin. If BD-rate returns faster than speed here, 06d could fall
+below the bar on a class that currently clears it. 06c is measured and
+known-good, so it should stay in the round as the fallback arm rather than
+being replaced by 06d outright.
+
+A2 remains the unsolved class. It has been roughly 30% worse than A1 in every
+variant so far (18.7/14.4, 20.9/13.5), which is too consistent to be tuning.
+The likeliest cause is the one named above: the profile is measured on the
+source, while 1080p at 33 frames spends most of its blocks on inter prediction,
+where the residual and not the source decides whether a cut pays. If 06d does
+not move A2, the next step is a prediction-aware profile, not another
+threshold.
+
+diff --git a/av2/encoder/encodeframe_utils.h b/av2/encoder/encodeframe_utils.h
+index caf5a04..c5bc006 100644
+--- a/av2/encoder/encodeframe_utils.h
++++ b/av2/encoder/encodeframe_utils.h
+@@ -174,6 +174,15 @@ typedef struct PartitionSearchState {
+   int ss_x;
+   int ss_y;
+ 
++  // Block scale directional structure of the source block, filled in lazily the
++  // first time the orientation based partition pruning needs it.
++  // src_profile_var_rows is the variance of the row mean profile (variation a
++  // horizontal cut can separate), src_profile_var_cols that of the column mean
++  // profile (variation a vertical cut can separate).
++  uint64_t src_profile_var_rows;
++  uint64_t src_profile_var_cols;
++  bool src_profile_valid;
++
+   // This flag will be set if best partition is found from the search.
+   bool found_best_partition;
+ 
+diff --git a/av2/encoder/partition_search.c b/av2/encoder/partition_search.c
+index cae1da5..a7d35cb 100644
+--- a/av2/encoder/partition_search.c
++++ b/av2/encoder/partition_search.c
+@@ -2997,6 +2997,11 @@ static void init_partition_search_state_params(
+     tree_type = SHARED_PART;
+   }
+ 
++  // The source structure profiles are measured lazily, per block.
++  part_search_state->src_profile_valid = false;
++  part_search_state->src_profile_var_rows = 0;
++  part_search_state->src_profile_var_cols = 0;
++
+   // Initialization of block size related parameters.
+   blk_params->mi_step = mi_size_wide[bsize] / 2;
+   blk_params->mi_step_h = mi_size_high[bsize] / 2;
+@@ -3290,6 +3295,236 @@ static void prune_rect_with_mlp(const AV2_COMP *cpi, MACROBLOCK *x,
+   }
+ }
+ 
++// How much stronger the structure along one axis must be than along the other
++// before partitions cutting across it are pruned. The plain rectangular
++// partitions carry far more of the coding gain than the extended ones, so they
++// demand markedly stronger evidence before being dropped.
++#define EXT_PART_ANISOTROPY 4
++#define RECT_PART_ANISOTROPY 8
++
++// Largest number of samples taken along each axis when profiling a block.
++#define PART_PROFILE_SAMPLES 32
++
++// Smallest profile variance that counts as evidence of structure at all.
++//
++// The orientation test below is a pure ratio, and a ratio between two
++// near-zero quantities carries no information. On a flat or lightly dithered
++// block both profile variances sit in the single digits, where sensor noise
++// alone can put one of them eight times above the other and trigger a prune
++// that no actual structure justifies. Requiring the dominant direction to clear
++// an absolute floor first costs almost no speed -- a flat block settles on
++// PARTITION_NONE quickly whether or not its rectangular partitions were pruned
++// -- while removing the prunes that were never evidence-based.
++//
++// Expressed in squared 10-bit sample units, so 64 is a profile standard
++// deviation of 8, i.e. about 2 levels of 8-bit amplitude. This is a first
++// principled guess and wants a sweep, not a defence.
++#define PART_PROFILE_MIN_VAR 64
++
++// Smallest block dimension the orientation test will act on, scaled by frame
++// width.
++//
++// Across all four presets the pruning cost markedly more BD-rate on Class A2
++// (1080p) than on Class A1 (4K) -- 1.29%-1.50% against 0.75%-0.96% -- while
++// delivering a *higher* speedup there, 18.2%-19.0% against 12.8%-14.8%. Four
++// independent measurements agreeing makes that a property of the heuristic
++// rather than noise: at 1080p it fires more often and is more often wrong.
++//
++// Block size in pixels is the reason. A 16x16 block at 1080p covers about four
++// times the scene area that a 16x16 block covers at 4K, so it contains more
++// distinct content, more of those blocks look directional under a
++// block-scale profile, and more of the partitions pruned on that basis were
++// genuinely useful. A fixed 16-pixel floor therefore means something different
++// at each resolution. Scaling it with frame width keeps the guard tracking
++// content scale instead of pixel count.
++//
++// Thresholds are chosen at the obvious resolution boundaries and are a first
++// calibration, not a tuned result.
++static AVM_INLINE int orientation_min_block_dim(const AV2_COMMON *const cm) {
++  if (cm->width >= 2560) return 16;  // 4K and above
++  if (cm->width >= 1280) return 32;  // 1080p / 720p
++  return 64;                         // below 720p
++}
++
++// The same floor, relaxed one step for the extended partitions.
++//
++// Applying a single floor to every partition type was too blunt a correction.
++// On Class A2 it cut BD-rate by 64% but cut speedup by 66% as well, moving both
++// in proportion and so leaving the ratio no better -- 14.4 before, 13.5 after.
++// A change only improves a ratio if it removes prunes that are expensive in
++// quality and cheap in speed, and raising one floor for everything cannot
++// distinguish those.
++//
++// The partition types are not equally valuable, and the patch already says so:
++// the plain rectangular partitions carry far more of the coding gain than the
++// extended ones, which is why they demand a higher anisotropy before being
++// dropped (8 against 4). The block-size floor should follow the same logic.
++// Losing a HORZ_3 or VERT_4A is cheaper than losing a HORZ, so extended
++// partitions do not need the full raised floor to stay safe.
++//
++// So at 1080p the rectangular partitions keep their protective floor of 32
++// while the extended ones return to 16, restoring pruning on 16x16..31x31
++// blocks. Those prunes were buying speed at the lower quality cost of the two
++// classes, and the flat floor in 06c discarded them along with the expensive
++// ones.
++static AVM_INLINE int orientation_min_block_dim_ext(const AV2_COMMON *const cm) {
++  return AVMMAX(16, orientation_min_block_dim(cm) / 2);
++}
++
++// Scales the evidence bar by how much of the GOP depends on this frame.
++//
++// A caveat on where this came from. It was originally introduced because Class
++// A2 scored worse than A1 while pruning more, which was read as a bad partition
++// choice persisting through a longer GOP. That reading assumed A2 differed from
++// A1 only in frame count. It does not -- A2 is 1080p and A1 is 4K -- so
++// resolution and GOP length are confounded in that comparison and it does not
++// establish a propagation effect. The resolution guard above targets the part
++// of the gap the data does support.
++//
++// What survives is the ordinary argument, independent of these measurements,
++// that frames many others predict from are worth more search: a partition lost
++// on a reference is paid for repeatedly. That justifies protecting the most
++// referenced frames, but not the broader gate this used to apply, which was
++// suppressing speedup on the whole top of the pyramid for a reason the data did
++// not support. It is now narrowed to key frames only, with the layers just
++// below merely held to a stricter bar.
++static AVM_INLINE uint64_t orientation_anisotropy_for_frame(
++    const AV2_COMP *const cpi, uint64_t base) {
++  (void)cpi;
++  // The frame gate is gone. Two reasons, one measured and one structural.
++  //
++  // Measured: on Class A1 the block-size floor did not change between patch 06
++  // and 06c -- 4K keeps a floor of 16 either way -- so the entire drop from
++  // +14.00% to +6.07% speedup on A1 came from the variance floor and this gate
++  // together. Losing 57% of the speedup bought a 61% BD-rate reduction, barely
++  // better than proportional, and a change that moves both in proportion does
++  // not move a ratio. The gate withheld pruning from frames low in the pyramid,
++  // which are precisely the frames given the deepest search and therefore the
++  // most expensive ones -- so it surrendered speedup where speedup is most
++  // available.
++  //
++  // Structural, and the part that should have been noticed first: this
++  // heuristic profiles the SOURCE block. Source structure drives the partition
++  // choice most directly when there is no prediction to flatten it, which means
++  // the test is at its most trustworthy on intra frames -- exactly the frames
++  // the gate was disabling it on. The gate was protecting the case the
++  // heuristic handles best.
++  return base;
++}
++
++// Measures how much the source block varies along each axis at partition scale.
++//
++// Per pixel gradients are a poor guide here: fine texture excites the
++// horizontal and the vertical gradient about equally, so on ordinary detailed
++// content their ratio stays near one no matter how the block is actually
++// structured. What a partition can exploit is variation at the scale of its own
++// sub-blocks, and that is exactly what the mean profiles capture. Averaging each
++// row collapses the horizontal detail and leaves the top-to-bottom structure a
++// horizontal cut could separate; averaging each column leaves the left-to-right
++// structure a vertical cut could separate. The variance of the two profiles,
++// both normalised to per pixel means so they are directly comparable, is the
++// measurement stored here.
++//
++// The block is sampled on a lattice of at most 32x32 points, so the cost is
++// negligible next to a single partition RD trial.
++static AVM_INLINE void compute_source_profile_variance(
++    const MACROBLOCK *x, BLOCK_SIZE bsize,
++    PartitionSearchState *part_search_state) {
++  const struct buf_2d *const src = &x->plane[AVM_PLANE_Y].src;
++  const int bw = block_size_wide[bsize];
++  const int bh = block_size_high[bsize];
++  const int step_x = AVMMAX(1, bw / PART_PROFILE_SAMPLES);
++  const int step_y = AVMMAX(1, bh / PART_PROFILE_SAMPLES);
++  const int num_x = AVMMIN(PART_PROFILE_SAMPLES, bw / step_x);
++  const int num_y = AVMMIN(PART_PROFILE_SAMPLES, bh / step_y);
++  const int stride = src->stride;
++
++  int64_t row_sum[PART_PROFILE_SAMPLES] = { 0 };
++  int64_t col_sum[PART_PROFILE_SAMPLES] = { 0 };
++  int64_t total = 0;
++
++  for (int si = 0; si < num_y; ++si) {
++    const uint16_t *const row = src->buf + (ptrdiff_t)si * step_y * stride;
++    for (int sj = 0; sj < num_x; ++sj) {
++      const int64_t value = row[sj * step_x];
++      row_sum[si] += value;
++      col_sum[sj] += value;
++    }
++    total += row_sum[si];
++  }
++
++  const int64_t mean = total / ((int64_t)num_x * num_y);
++  int64_t var_rows = 0;
++  for (int si = 0; si < num_y; ++si) {
++    const int64_t diff = row_sum[si] / num_x - mean;
++    var_rows += diff * diff;
++  }
++  int64_t var_cols = 0;
++  for (int sj = 0; sj < num_x; ++sj) {
++    const int64_t diff = col_sum[sj] / num_y - mean;
++    var_cols += diff * diff;
++  }
++
++  // Variation a horizontal cut can separate, and the vertical cut counterpart.
++  part_search_state->src_profile_var_rows = (uint64_t)(var_rows / num_y);
++  part_search_state->src_profile_var_cols = (uint64_t)(var_cols / num_x);
++  part_search_state->src_profile_valid = true;
++}
++
++// Prunes the partitions whose cuts run across the dominant orientation of the
++// source structure.
++//
++// A vertical cut can only pay off when the block content actually changes from
++// left to right, and a horizontal cut only when it changes from top to bottom.
++// The two profile variances give a cheap, prediction independent test for
++// exactly that. When one direction carries nearly all of the block scale
++// variation, the partitions splitting along the other one are spending full RD
++// trials on cuts that have nothing to separate, so they are dropped.
++//
++// `anisotropy` is how many times larger one variance must be than the other
++// before the pruning applies; callers pass a higher value for the plain
++// rectangular partitions, which are more valuable and therefore need stronger
++// evidence than the extended ones. The test is deliberately one sided: when the
++// two variances are comparable (including the degenerate all-zero case of a
++// flat block) nothing is pruned, so only clearly directional content is
++// affected.
++static AVM_INLINE void prune_partitions_by_structure_orientation(
++    const MACROBLOCK *x, PartitionSearchState *part_search_state,
++    const PARTITION_TYPE *horz_parts, const PARTITION_TYPE *vert_parts,
++    int num_parts, uint64_t anisotropy, int min_dim) {
++  if (part_search_state->forced_partition != PARTITION_INVALID) return;
++  // A zero bar means this frame is too heavily referenced to prune on.
++  if (anisotropy == 0) return;
++
++  const BLOCK_SIZE bsize = part_search_state->part_blk_params.bsize;
++  // Below min_dim the sampled profiles are too short for the ratio to be
++  // meaningful, and the partitions are cheap to evaluate anyway. The floor is
++  // resolution-scaled -- see orientation_min_block_dim() for why a fixed
++  // pixel count means different things at 4K and at 1080p.
++  if (block_size_wide[bsize] < min_dim || block_size_high[bsize] < min_dim)
++    return;
++
++  if (!part_search_state->src_profile_valid)
++    compute_source_profile_variance(x, bsize, part_search_state);
++
++  const uint64_t var_rows = part_search_state->src_profile_var_rows;
++  const uint64_t var_cols = part_search_state->src_profile_var_cols;
++
++  // Without real structure in the dominant direction, the ratio below is
++  // comparing noise against noise.
++  if (AVMMAX(var_rows, var_cols) < PART_PROFILE_MIN_VAR) return;
++
++  if (var_cols * anisotropy < var_rows) {
++    // Structure is essentially top-to-bottom only: nothing for a vertical cut
++    // to separate.
++    for (int i = 0; i < num_parts; ++i)
++      part_search_state->prune_partition[vert_parts[i]] = true;
++  } else if (var_rows * anisotropy < var_cols) {
++    for (int i = 0; i < num_parts; ++i)
++      part_search_state->prune_partition[horz_parts[i]] = true;
++  }
++}
++
+ // Prune rectangular partition types based on mlp. One of the features of mlp is
+ // partition none rdcost. It is possible that none rd might not be evaluated by
+ // now if adaptive_partition_search_order is enabled. In this case default none
+@@ -3345,6 +3580,15 @@ static void prune_rect_partitions(AV2_COMP *const cpi, ThreadData *td,
+                        &part_search_state->prune_partition[PARTITION_VERT]);
+   }
+ 
++  {
++    static const PARTITION_TYPE horz[] = { PARTITION_HORZ };
++    static const PARTITION_TYPE vert[] = { PARTITION_VERT };
++    prune_partitions_by_structure_orientation(
++        x, part_search_state, horz, vert, 1,
++        orientation_anisotropy_for_frame(cpi, RECT_PART_ANISOTROPY),
++        orientation_min_block_dim(cm));
++  }
++
+   if (cpi->sf.part_sf.prune_rect_with_none_rd &&
+       part_search_state->forced_partition == PARTITION_INVALID &&
+       !frame_is_intra_only(cm) && part_none_rd < INT64_MAX) {
+@@ -4311,7 +4555,7 @@ static AVM_INLINE void prune_part_4_with_partition_boundary(
+ /*!\brief Pruning logic for PARTITION_HORZ_3 and PARTITION_VERT_3 based on
+  * non-ext partitions search results. */
+ static AVM_INLINE void prune_ext_partitions_3way(
+-    AV2_COMP *const cpi, PC_TREE *pc_tree,
++    AV2_COMP *const cpi, const MACROBLOCK *x, PC_TREE *pc_tree,
+     PartitionSearchState *part_search_state, bool *partition_boundaries) {
+   const AV2_COMMON *const cm = &cpi->common;
+   const PARTITION_SPEED_FEATURES *part_sf = &cpi->sf.part_sf;
+@@ -4322,6 +4566,15 @@ static AVM_INLINE void prune_ext_partitions_3way(
+     return;
+   }
+ 
++  {
++    static const PARTITION_TYPE horz3[] = { PARTITION_HORZ_3 };
++    static const PARTITION_TYPE vert3[] = { PARTITION_VERT_3 };
++    prune_partitions_by_structure_orientation(
++        x, part_search_state, horz3, vert3, 1,
++        orientation_anisotropy_for_frame(cpi, EXT_PART_ANISOTROPY),
++        orientation_min_block_dim_ext(cm));
++  }
++
+   // Prune horz 3 with speed features
+   if (part_search_state->partition_allowed[PARTITION_HORZ_3] &&
+       !frame_is_intra_only(cm) && forced_partition != PARTITION_HORZ_3) {
+@@ -4522,13 +4775,24 @@ static INLINE void search_intra_region_partitioning(
+ /*!\brief Pruning logic for PARTITION_HORZ_4A/B and PARTITION_VERT_4A/B based on
+  * non-ext and 3 way partitions search results.*/
+ static AVM_INLINE void prune_ext_partitions_4way(
+-    AV2_COMP *const cpi, PC_TREE *pc_tree,
++    AV2_COMP *const cpi, const MACROBLOCK *x, PC_TREE *pc_tree,
+     PartitionSearchState *part_search_state, bool *partition_boundaries) {
+   const AV2_COMMON *const cm = &cpi->common;
+   const PARTITION_SPEED_FEATURES *part_sf = &cpi->sf.part_sf;
+   const PARTITION_TYPE forced_partition = part_search_state->forced_partition;
+   const int cur_region_type = pc_tree->region_type;
+ 
++  {
++    static const PARTITION_TYPE horz4[] = { PARTITION_HORZ_4A,
++                                            PARTITION_HORZ_4B };
++    static const PARTITION_TYPE vert4[] = { PARTITION_VERT_4A,
++                                            PARTITION_VERT_4B };
++    prune_partitions_by_structure_orientation(
++        x, part_search_state, horz4, vert4, 2,
++        orientation_anisotropy_for_frame(cpi, EXT_PART_ANISOTROPY),
++        orientation_min_block_dim_ext(cm));
++  }
++
+   // Prune HORZ 4A with speed features
+   if (part_search_state->partition_allowed[PARTITION_HORZ_4A] &&
+       forced_partition != PARTITION_HORZ_4A) {
+@@ -5533,7 +5797,7 @@ BEGIN_PARTITION_SEARCH:
+       &cpi->sf.part_sf, bsize, max_recursion_depth, false);
+   bool partition_boundaries[MAX_MIB_SQUARE] = { 0 };
+ 
+-  prune_ext_partitions_3way(cpi, pc_tree, &part_search_state,
++  prune_ext_partitions_3way(cpi, x, pc_tree, &part_search_state,
+                             partition_boundaries);
+   for (PARTITION_TYPE partition_type = PARTITION_HORZ_3;
+        partition_type <= PARTITION_VERT_3; ++partition_type) {
+@@ -5547,7 +5811,7 @@ BEGIN_PARTITION_SEARCH:
+     const int uneven_4way_recur_depth = get_ext_partitions_recur_depth(
+         &cpi->sf.part_sf, bsize, max_recursion_depth, true);
+ 
+-    prune_ext_partitions_4way(cpi, pc_tree, &part_search_state,
++    prune_ext_partitions_4way(cpi, x, pc_tree, &part_search_state,
+                               partition_boundaries);
+     for (PARTITION_TYPE partition_type = PARTITION_HORZ_4A;
+          partition_type <= PARTITION_VERT_4B; ++partition_type) {
