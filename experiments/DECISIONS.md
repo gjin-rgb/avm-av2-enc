@@ -6,6 +6,97 @@ CTC slot rediscovering it.
 
 ---
 
+## 2026-08-13 — Multi-speed data corrects two earlier conclusions; 06c and 09b
+
+Speeds 1-3 for patches 06 and 09 arrived. Two things in the earlier analysis
+were wrong and are corrected here.
+
+### Correction 1: Class A2 is 1080p, not 4K
+
+The 2026-08-12 entry attributed the A1-vs-A2 gap to GOP length, reading A2 as
+"same content, 33 frames instead of 17". A2 is **1080p**; A1 is 4K. Resolution
+and frame count are confounded in that comparison, so it does **not** establish
+the propagation effect that the frame-aware gate in patch 06b was built on.
+
+What the four presets *do* agree on is a resolution effect:
+
+    A1 (4K)     BD 0.75% - 0.96%    speedup 12.85% - 14.85%
+    A2 (1080p)  BD 1.29% - 1.50%    speedup 18.21% - 18.97%
+
+Consistently worse BD-rate *and* higher speedup at 1080p, in four independent
+measurements. The heuristic fires more often there and is more often wrong.
+Block size in pixels is the likely reason: a 16x16 block at 1080p covers about
+four times the scene area of one at 4K, so more blocks look directional under a
+block-scale profile. Patch 06c scales the minimum block size with frame width,
+which acts on A2 (floor 16 -> 32) and leaves A1 unchanged — exactly matching
+which class needs the larger correction (28% vs 6.7%).
+
+### Correction 2: patch 09 passes at Speed 4 only
+
+The report's summary line says "PASS (Spd 2, 3, 4)". Computing each preset
+against its own bar does not support that:
+
+| Speed | Bar | A1 | A2 |
+|---|---|---|---|
+| 4 | 20 | 23.6 PASS | 25.2 PASS |
+| 3 | 25 | -0.27% speedup, i.e. slower | 23.0 fail |
+| 2 | 30 | 8.8 fail | 25.9 fail |
+| 1 | 35 | 9.8 fail | 29.5 fail |
+
+i09 passes at **Speed 4 only**, and is a net slowdown on 4K at Speed 3.
+Adopting it at Speeds 2-3 on the strength of that summary would be a mistake.
+
+### Patch 06 fails at every preset; only Speed 4 is worth targeting
+
+Speed and BD-rate are both essentially flat across presets (12.8-14.9% / 0.75-
+0.96% on A1) while the bar rises 20 -> 35. Its best ratio, 18.7, is at Speed 4
+where the bar is lowest. Speeds 1-3 are unreachable and should not consume
+slots.
+
+### New patches
+
+**`0009b`** — supersedes 09. Two changes:
+1. The stationarity measurement was computed unconditionally before the
+   candidate loop, and its check ran *before* the cheap eligibility tests. So
+   the residual walk was paid for candidates that would be rejected anyway, and
+   on blocks where every split is eliminated by other speed features and it can
+   never fire. That is the most likely source of the -0.27% at Speed 3 on 4K.
+   It is now lazy, runs after the cheap checks, and is skipped entirely when the
+   only surviving candidate is TX_PARTITION_NONE. Expected to be strictly
+   better: same decisions, less work.
+2. `TX_PART_STATIONARITY_MARGIN` 4 -> 2, loosening the test from "strongest
+   strip within 1.25x of mean" to "within 1.50x". Clearing a bar of 20 at ratio
+   23-25 while costing ~0.1% BD-rate means the threshold sat far inside the safe
+   region with speedup unclaimed. If the ratio merely held near 23, +0.33% BD
+   would be worth roughly +8% speedup and still pass.
+
+**`0006c`** — supersedes 06 and 06b. Keeps the variance floor, adds the
+resolution-scaled block floor, and **narrows** the frame gate to key frames
+only (layers 1 and 2 now get 4x and 2x stricter bars rather than being disabled
+outright), recovering speedup that 06b was giving away for a reason the data
+did not support.
+
+### A note on the "tighten alpha by 15-20%" recommendation
+
+Tightening reduces pruning, which lowers BD-rate **and** speedup together. The
+ratio only improves if BD-rate falls *faster* than speed does, and a blunt
+threshold move tends to shift both in proportion, leaving the ratio near 18.7
+with less speed to show for it. Every change in 06c instead removes a class of
+prune that is expensive in quality and cheap in speed — flat blocks, oversized
+blocks at low resolution — which is what actually moves a ratio.
+
+### Verified locally
+
+Bit-signature comparison, 416x240, 16 frames, QP 110/185:
+
+    baseline   d3b62260c8f56fb5b2eeacdf4b73730c
+    0006       bc9ce9efde34073d859accbb4166b12a   differs from baseline
+    0006b      aecedc46b9080213cbb8b4ff9ad20bbb   differs from both
+
+confirming 06b's gate was live rather than inert. All patches build and encode.
+
+---
+
 ## 2026-08-12 — CTC round 1 results: 1 promote, 1 improve, 8 discard
 
 Anchor `d6b40b789381601440e4ce2cc1164cd57e8c3c7d`, Class A1 (17f 4K) and A2

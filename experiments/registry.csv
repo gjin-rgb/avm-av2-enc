@@ -2,7 +2,7 @@
 > DECISIONS.md is the source of truth for "why".
 >
 > CTC round 1 results are against anchor d6b40b789381601440e4ce2cc1164cd57e8c3c7d,
-> Class A1 (17f, 4K) and A2 (33f, 4K), Speed 4 for pruning patches, Speed 2 for
+> Class A1 (17f, 4K) and A2 (33f, 1080p), Speed 4 for pruning patches, Speed 2 for
 > the bit-exact ones. Bar is the Complexity-to-Efficiency ratio
 > (speedup% / BD-rate%): >=20 at Speed 4, >=25 Speed 3, >=30 Speed 2, >=35 Speed 1.
 >
@@ -24,3 +24,5 @@ ALL10,all ten patches combined,mixed,n/a,4,+20.34%,+2.50%,8.1,+24.00%,+3.45%,7.0
 ALL10-S3,all ten combined at Speed 3,mixed,n/a,3,+25.18%,+3.12%,8.1,+29.25%,+3.85%,7.6,DISCARD,"Bar at Speed 3 is 25; ratio 8.1/7.6"
 ALL10-S2,all ten combined at Speed 2,mixed,n/a,2,+30.74%,+2.55%,12.1,n/a,n/a,n/a,DISCARD,"Best ratio of any combination (12.1) and still far under the Speed-2 bar of 30. Note the speedup rises at slower presets (30.7% at S2 vs 20.3% at S4) for near-identical BD, so the heuristics prune redundancy that only exists in deeper searches"
 I06+I09,proposed next combination,approx,n/a,4,~16.2%(est),~0.86%(est),~18.9,~20.4%(est),~1.38%(est),~14.8,NEXT-ROUND,"Estimated: speedups compound multiplicatively, BD additively. Barely better than i06 alone because i09 is small. This is the arm the next round should test, NOT all-10"
+i09b,tx-partition stationarity (lazy+aggressive),approx,n/a,4,-,-,-,-,-,-,NEXT-ROUND,"Supersedes i09. Measurement now lazy and after the cheap checks (i09 was -0.27% i.e. SLOWER on A1 at Speed 3: overhead paid where it could never fire). MARGIN 4->2 to claim speed i09 left unused at only +0.11% BD. Sweep with -DTX_PART_STATIONARITY_MARGIN=N"
+i06c,orientation pruning (resolution-scaled),approx,n/a,4,-,-,-,-,-,-,NEXT-ROUND,"Supersedes i06 and i06b. Adds resolution-scaled min block size: all 4 presets show worse BD AND higher speedup at 1080p than 4K. Floor 16->32 at 1080p, 16 unchanged at 4K, so it acts on the class needing -28% and not the one needing -6.7%. Frame gate narrowed to key frames only"
