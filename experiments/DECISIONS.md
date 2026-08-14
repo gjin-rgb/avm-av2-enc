@@ -6,6 +6,86 @@ CTC slot rediscovering it.
 
 ---
 
+## 2026-08-14 — Round 3: both bets lost. 09b is final; 06e rebuilt from marginal ratios
+
+    09c   A1 +4.40% / +0.30%  14.7 FAIL    A2 +4.71% / +0.40%  11.8 FAIL
+    06d   A1 +11.96% / +0.75% 15.9 FAIL    A2 +9.57% / +0.92%  10.4 FAIL
+
+### 09 is finished: 09b is the peak, adopt it and stop
+
+The margin curve has three points now and 09b is the maximum on both classes:
+
+    MARGIN 4   A1 23.6   A2 25.2
+    MARGIN 2   A1 26.7   A2 51.0     <- peak, PASS both
+    MARGIN 1   A1 14.7   A2 11.8     <- decay
+
+Margin 1 bought only +0.4% to +1.1% more speedup while BD-rate roughly doubled
+to +0.30%/+0.40%. The decay I said had to arrive eventually arrived at exactly
+the next step. **Adopt 09b. No further tuning of this parameter is warranted** —
+the curve has been bracketed on both sides and the top is measured, not
+inferred.
+
+### 06: use marginal ratios, not hypotheses
+
+Every 06 variant so far was built on a story about which blocks are unsafe, and
+two of the three stories were wrong. The three measured variants allow the
+question to be answered directly instead. For each change, the speed given up
+divided by the BD-rate recovered gives the marginal ratio of the prunes that
+change removed; a change raises the overall ratio only when its marginal ratio
+is *below* the ratio already achieved.
+
+    A1  variance floor              +2.04% speed for +0.00% BD   marginal  inf
+    A1  frame gate                  +5.89% speed for +0.46% BD   marginal 12.8
+    A2  var floor + rect floor 32   +8.95% speed for +0.37% BD   marginal 24.2
+    A2  frame gate + ext floor 32   +3.36% speed for +0.46% BD   marginal  7.3
+
+**The variance floor was worthless.** It cost 2.04% of the 4K speedup and
+returned 0.00% BD-rate. Not a poor trade — no trade. It has been carried in
+every variant since 06b on the strength of an argument about flat blocks that
+the data never supported.
+
+**The frame gate works, and 06d was wrong to remove it.** At marginal 12.8 the
+prunes it removes sit well under the bar. My structural argument for deleting it
+— that a source-based profile is most trustworthy on intra frames — was not
+wrong about accuracy, but accuracy was not the deciding factor: a prune on a
+frame the whole GOP predicts from is paid for by every frame that follows,
+however well justified it looked. Restored in 06e.
+
+**The block-size floor was backwards.** Raising it to 32 on 1080p removed prunes
+worth marginal 24.2, comfortably *above* the bar. The 16-31 blocks 06c excluded
+were the good prunes, which is why 06c moved A2 backwards (14.4 -> 13.5). The
+damage on 1080p is in the large blocks.
+
+In hindsight that is the reading that should have come first. The profile
+measures orientation about equally well at any size; what does not scale is the
+cost of being wrong. A mistaken prune on a 128x128 block commits sixty-four
+times the area to a worse partition than the same mistake on a 16x16. Large
+blocks are not less measurable — they are more expensive to get wrong.
+
+### 06e
+
+Floor stays at 16 everywhere; the variance floor is gone; the frame gate is
+back; and the required anisotropy now scales with block size (base under 32,
+doubled at 32-63, quadrupled at 64+). The frame and size multipliers compose, so
+a large block on a heavily referenced frame must clear a very high bar while a
+small block on a leaf frame is pruned on the original evidence.
+
+**Honest odds on A2.** It has never exceeded 14.4, and its best value came from
+the original patch with no corrections at all. Predicting it clears 20 would be
+optimistic. 06e is the first version aimed at where the measurements locate the
+damage rather than where I assumed it was, which is a better position than the
+last two rounds, not a guarantee.
+
+If 06e lands short on A2, stop tuning. The remaining lever is the one named two
+rounds ago and still unbuilt: the profile is measured on the **source**, and A2
+spends most of its 33 frames on inter blocks where the residual, not the source,
+decides whether a cut pays.
+
+**06c + 09b remains shippable today** at +11.87% / ratio 22.0 on 4K. Nothing
+here is a prerequisite for taking that.
+
+---
+
 ## 2026-08-13 — Round 2: 09b passes both classes; 06c improved A1 by the wrong mechanism
 
 Speed 4, anchor `d6b40b7893`, bar 20.
