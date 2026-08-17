@@ -1,0 +1,86 @@
+Patch 11: remove two speed features that cost quality and save no time.
+
+Standalone; touches only av2/encoder/speed_features.c.
+
+From the 101-feature study, two Speed-3 assignments are not tradeoffs at all:
+
+    Test 61  disable_smooth_intra             BD +1.08%   time -0.26%
+    Test 72  enable_winner_mode_for_coeff_opt BD +1.12%   time -0.56%
+
+Both cost over a percent of BD-rate while the measured time "saving" is
+negative -- the encoder ran slower with the shortcut enabled. Even taking the
+timing at face value they are pure losses, and the timing should NOT be taken
+at face value: the same study's features with 0.00% BD-rate on both classes,
+which by construction cannot have changed runtime, report time savings
+averaging -0.44% at Speed 3 with a standard deviation of 0.16%. Both of these
+sit inside that band. The honest reading is that they save nothing measurable
+and cost more than a percent each.
+
+A speed feature that buys no speed is a defect, not a tradeoff, so both
+assignments are removed rather than replaced with a smarter gate. The defaults
+in av2_set_speed_features_framesize_independent() are already 0 for both.
+
+The source report proposes a new "Planar/DC RD-margin early exit" heuristic to
+recover the 1.08% that Test 61 loses. That is more machinery than the problem
+needs: the flag itself is what loses the quality, and deleting the assignment
+recovers the same 1.08% with no new code, no new threshold and no new failure
+mode. Build a replacement only if a version that actually saves time is wanted.
+
+Expected result: about -1.0% to -2.2% BD-rate (the two are unlikely to be
+exactly additive) at a time cost of roughly zero, possibly a small gain. This
+is a quality patch, not a speed patch -- it will not move the speedup number,
+and it should be evaluated on BD-rate with the requirement that encode time
+does not regress beyond noise.
+
+Both sites are kept behind build-time switches so the change can be A/B'd
+without editing the patch:
+
+    -DAVM_KEEP_DISABLE_SMOOTH_INTRA=1
+    -DAVM_KEEP_WINNER_COEFF_OPT=1
+
+Suggested arms: this patch alone, and each switch separately if the combined
+result is ambiguous.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..8413074 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -524,8 +524,20 @@ static void set_good_speed_features_framesize_independent(
+     sf->inter_sf.txfm_rd_gate_level =
+         boosted ? 0 : (is_boosted_arf2_bwd_type ? 1 : 2);
+ 
++    // disable_smooth_intra was measured as a pure loss on CTC RA: turning it ON
++    // costs +1.08% BD-rate (PSNR-YUV) while SAVING no time at all -- the
++    // measured time delta was -0.26%, i.e. the encoder ran slower with the
++    // shortcut enabled, and that figure is itself inside the study's timing
++    // noise. A speed feature that buys no speed is not a tradeoff, it is a
++    // defect, so the assignment is removed rather than replaced. The default
++    // set in av2_set_speed_features_framesize_independent() is 0.
++    //
++    // Restore the old behaviour for an A/B by building with
++    // -DAVM_KEEP_DISABLE_SMOOTH_INTRA=1.
++#if defined(AVM_KEEP_DISABLE_SMOOTH_INTRA) && AVM_KEEP_DISABLE_SMOOTH_INTRA
+     sf->intra_sf.disable_smooth_intra =
+         !frame_is_intra_only(&cpi->common) || (cpi->rc.frames_to_key != 1);
++#endif
+     sf->intra_sf.prune_palette_search_level = 2;
+ 
+     sf->tpl_sf.prune_ref_frames_in_tpl = 1;
+@@ -542,7 +554,17 @@ static void set_good_speed_features_framesize_independent(
+ 
+     // TODO(any): Refactor the code related to following winner mode speed
+     // features
++    // enable_winner_mode_for_coeff_opt was measured as a second pure loss:
++    // +1.12% BD-rate for a time delta of -0.56%, again a slowdown rather than a
++    // saving. Restricting coefficient optimisation to winner candidates
++    // degrades the RD values the mode ranking is built from, so later decisions
++    // are made on distorted costs -- which is consistent with a large quality
++    // loss appearing alongside no speed gain.
++    //
++    // Build with -DAVM_KEEP_WINNER_COEFF_OPT=1 to restore for an A/B.
++#if defined(AVM_KEEP_WINNER_COEFF_OPT) && AVM_KEEP_WINNER_COEFF_OPT
+     sf->winner_mode_sf.enable_winner_mode_for_coeff_opt = 1;
++#endif
+     // TODO(any): Re-enable for inter frames after fixing speed feature.
+     sf->winner_mode_sf.enable_winner_mode_for_tx_size_srch = 0;
+     sf->winner_mode_sf.enable_winner_mode_for_use_tx_domain_dist = 1;

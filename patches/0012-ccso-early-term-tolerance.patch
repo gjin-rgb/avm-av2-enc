@@ -1,0 +1,107 @@
+Patch 12: expose and loosen the CCSO early-termination tolerance.
+
+Standalone; touches only av2/encoder/pickccso.c.
+
+The 101-feature study measured early_terminate_ccso_search_by_cost as both the
+largest single time consumer in the encoder and one of its most efficient
+features:
+
+    +31.07% time saving, +0.36% BD-rate, ratio 86.3, against a Speed-2 bar of 30
+
+A ratio of 86 against a bar of 30 is nearly three times the headroom the
+feature is required to have, and unclaimed headroom is unclaimed speedup. The
+study asked of every feature "does removing it hurt?" but never "could it be
+pushed further?" -- so a feature sitting far inside the safe region looks like a
+success and is left alone.
+
+That second question has already paid once on this branch. Transform-partition
+stationarity pruning was passing at ratio 23.6 when its threshold was loosened;
+speedup went from +2.60% to +4.01% and the ratio IMPROVED to 26.7, because the
+original setting had been chosen conservatively rather than measured. CCSO is a
+much larger target than that one: at roughly a third of encode time, a
+proportionally similar gain is worth several percent of total runtime instead of
+one.
+
+The mechanism is a single hard-coded scalar in the search loop:
+
+    if (early_terminate_ccso_search && final_filtered_cost != UINT64_MAX &&
+        1.001 * final_filtered_cost > last_best_cost)
+      goto exit_loops;
+
+1.001 is a 0.1% tolerance, which is close to no tolerance at all: the search
+continues unless the current configuration is essentially tied with the best so
+far. This patch names it CCSO_EARLY_TERM_TOLERANCE and sets it to 1.01, a 1%
+tolerance.
+
+What this is: one step along a curve, not a tuned value. The ratio must decay as
+the tolerance loosens -- the stationarity margin decayed sharply at its third
+step, from 26.7 to 14.7 -- and finding where it crosses the bar is exactly what
+a sweep is for. Because the constant is now a build-time define, sweeping needs
+no patch edits:
+
+    -DCCSO_EARLY_TERM_TOLERANCE=1.005     halfway
+    -DCCSO_EARLY_TERM_TOLERANCE=1.02      more aggressive
+    -DCCSO_EARLY_TERM_TOLERANCE=1.001     exactly today's shipping behaviour
+
+Suggested arms: 1.005 and 1.01 together bracket the near region cheaply. Run at
+Speed 2, where the feature is enabled and where its measurement came from.
+
+Expected direction: more speedup, more BD-rate. Whether the ratio stays above 30
+is the whole question. The 1.001 fallback means a failed arm costs a rebuild
+rather than a lost patch.
+
+diff --git a/av2/encoder/pickccso.c b/av2/encoder/pickccso.c
+index a589842..70508f4 100644
+--- a/av2/encoder/pickccso.c
++++ b/av2/encoder/pickccso.c
+@@ -25,6 +25,40 @@
+ #include "av2/encoder/encoder.h"
+ #include "av2/encoder/pickccso.h"
+ 
++// How much worse than the running best a filtered cost may be before the CCSO
++// search abandons the remaining configurations.
++//
++// This is the single scalar controlling how aggressively CCSO search
++// terminates, and it was hard-coded at 1.001 -- a 0.1% tolerance, which is
++// close to no tolerance at all. The 101-feature study measured the feature it
++// governs as both the largest single time consumer in the encoder and one of
++// the most efficient:
++//
++//     early_terminate_ccso_search_by_cost   +31.07% time   +0.36% BD-rate
++//                                           ratio 86.3 vs a Speed-2 bar of 30
++//
++// A ratio of 86 against a bar of 30 is nearly three times the headroom the
++// feature is required to have, and that headroom is unclaimed speedup. The
++// study asked of every feature "does removing it hurt?" and never asked "could
++// it be pushed further?". Asking the second question of transform-partition
++// stationarity pruning took it from +2.60% to +4.01% speedup while its ratio
++// IMPROVED, 23.6 to 26.7, because its threshold had also been set well inside
++// the safe region.
++//
++// CCSO is a much larger target: it accounts for roughly a third of encode time,
++// so a proportionally similar gain is worth several percent of total runtime
++// rather than one.
++//
++// 1.01 is one step along that curve, not a tuned value -- a 1% tolerance
++// instead of 0.1%. The ratio will decay as this loosens, exactly as the
++// stationarity margin did at its third step, and finding where it crosses the
++// bar is what a sweep is for. Sweep without editing this patch:
++// -DCCSO_EARLY_TERM_TOLERANCE=1.005 and so on; 1.001 restores current
++// shipping behaviour exactly.
++#ifndef CCSO_EARLY_TERM_TOLERANCE
++#define CCSO_EARLY_TERM_TOLERANCE 1.01
++#endif
++
+ typedef struct {
+   uint8_t final_band_log2;
+   int8_t best_filter_offset[CCSO_NUM_COMPONENTS][CCSO_BAND_NUM * 16];
+@@ -1609,7 +1643,8 @@ static void derive_ccso_filter(CcsoCtx *ctx, AV2_COMMON *cm, const int plane,
+               }
+               if (early_terminate_ccso_search &&
+                   final_filtered_cost != UINT64_MAX &&
+-                  1.001 * final_filtered_cost > last_best_cost)
++                  CCSO_EARLY_TERM_TOLERANCE * final_filtered_cost >
++                      last_best_cost)
+                 goto exit_loops;
+             }
+           }
