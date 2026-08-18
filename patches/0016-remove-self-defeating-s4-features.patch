@@ -1,0 +1,76 @@
+Patch 16: remove three speed-4 features that cost quality and save no time.
+
+Standalone; the same class of change as patch 0011, which was confirmed on
+cloud EDA to recover coding gain without a slowdown.
+
+Patch 0011 removed two speed-3 assignments that took BD-rate and returned no
+measurable time. The same screen applied to speed 4 finds three more:
+
+    Test 94  perform_coeff_opt_based_on_satd   BD +0.15%   time -0.00%
+    Test 95  multi_winner_mode_type (inter)    BD +0.36%   time +0.15%
+    Test 97  cdef_pick_method = LVL3           BD +0.15%   time -0.31%
+
+Test 97 is the clearest: the LVL3 CDEF search is both slower AND worse than the
+LVL1 search speed 2 already selects, so the speed-4 assignment is a strict
+regression on both axes. Test 94 returns nothing at all. Test 95 returns +0.15%,
+which is inside the speed-4 timing noise band -- the study's features with 0.00%
+BD-rate on both classes, which cannot have changed runtime, still report a mean
+of +0.22% with a standard deviation of 0.16% at this preset.
+
+Taken together: about +0.66% BD-rate recovered, and a net time change of roughly
++0.16% in the favourable direction, all three figures being within noise
+individually.
+
+This is a quality patch, not a speed patch. Judge it on BD-rate, with the
+requirement that encode time not regress beyond noise. Patch 0011 behaved
+exactly this way and was worth taking; the mechanism proposed for why 0004
+(restore smooth intra) was also *faster* -- better predictions shortening
+downstream transform and partition search -- applies here too, so a small
+speedup would not be surprising.
+
+Each site is kept behind a build-time switch for attribution if the combined
+result is ambiguous:
+
+    -DAVM_KEEP_S4_COEFF_OPT_SATD=1
+    -DAVM_KEEP_S4_MULTI_WINNER_OFF=1
+    -DAVM_KEEP_S4_CDEF_LVL3=1
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..a7e4058 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -590,19 +590,34 @@ static void set_good_speed_features_framesize_independent(
+     sf->tx_sf.tx_type_search.prune_tx_type_est_rd = 1;
+ 
+     sf->rd_sf.perform_coeff_opt = is_boosted_arf2_bwd_type ? 3 : 5;
++    // Test 94 measured this at +0.15% BD-rate for a time saving of -0.00%.
++    // It takes quality and returns nothing. Removed; the default is 0.
++#if defined(AVM_KEEP_S4_COEFF_OPT_SATD) && AVM_KEEP_S4_COEFF_OPT_SATD
+     sf->rd_sf.perform_coeff_opt_based_on_satd =
+         is_boosted_arf2_bwd_type ? 1 : 2;
++#endif
+     sf->rd_sf.tx_domain_dist_thres_level = 1;
+ 
++    // Test 95 measured disabling multi-winner mode on inter frames at +0.36%
++    // BD-rate for +0.15% time -- a ratio of 0.4 against a bar of 20. The time
++    // figure is itself inside the speed-4 noise band, so this is close to pure
++    // quality loss.
+     // TODO(any): Extend multi-winner mode processing support for inter frames
++#if defined(AVM_KEEP_S4_MULTI_WINNER_OFF) && AVM_KEEP_S4_MULTI_WINNER_OFF
+     sf->winner_mode_sf.multi_winner_mode_type =
+         frame_is_intra_only(&cpi->common) ? MULTI_WINNER_MODE_DEFAULT
+                                           : MULTI_WINNER_MODE_OFF;
++#endif
+     // TODO(any): Re-enable for all frames after fixing speed feature.
+     sf->winner_mode_sf.enable_winner_mode_for_tx_size_srch = 0;
+ 
+     sf->lpf_sf.lpf_pick = LPF_PICK_FROM_FULL_IMAGE_NON_DUAL;
++    // Test 97 measured the LVL3 CDEF search at +0.15% BD-rate for a time
++    // saving of -0.31%: it is both slower and worse than the LVL1 search that
++    // speed 2 already selects. Removing the assignment leaves LVL1 in place.
++#if defined(AVM_KEEP_S4_CDEF_LVL3) && AVM_KEEP_S4_CDEF_LVL3
+     sf->lpf_sf.cdef_pick_method = CDEF_FAST_SEARCH_LVL3;
++#endif
+ 
+     sf->mv_sf.reduce_search_range = 1;
+ 

@@ -1,0 +1,68 @@
+Patch 14: promote the speed-4 warp search pattern to speed 3.
+
+Standalone. Composes with patches 13, 15 and 16.
+
+Of the three features that genuinely clear their bar at speed 4 in the
+101-feature study, two have now been promoted to speed 3 and both returned at
+or above their speed-4 measurement:
+
+    prune_tx_type_using_stats   +4.90% @ s4  ->  +6.12% @ s3   (ratio 34.0)
+    dc_blk_pred_level           +3.08% @ s4  ->  +3.08% @ s3   (ratio ~308)
+    warp_search_method          +1.65% @ s4  ->  not promoted
+
+This patch promotes the third. WARP_SEARCH_DIAMOND replaces the square warp
+search pattern with a diamond one; speed 3 currently pays for the wider pattern.
+
+The direction is principled rather than hopeful: a pattern-reduction feature
+saves more where the search it replaces is deeper, and speed 3 searches warp
+parameters harder than speed 4 does. The same scaling appeared in the combined
+runs on this branch, where an identical patch set gained +30.7% at speed 2
+against +20.3% at speed 4 for essentially unchanged BD-rate.
+
+The risk is that this is the thinnest of the three margins: ratio 20.6 measured
+against a speed-3 bar of 25. If time saving and BD-rate scale together on
+promotion -- as they roughly did for transform-statistics pruning, whose ratio
+fell from 49.0 to 34.0 when it moved from speed 4 to speed 3 -- then the ratio
+barely moves and this fails. It clears only if the extra warp search at speed 3
+turns out to be disproportionately redundant.
+
+Because of that, this is deliberately a separate arm from patch 13 rather than
+bundled with it. Bundling a likely pass with a marginal one costs the ability to
+tell which did what, and this branch has already paid for that lesson once.
+
+Expected: +1.5% to +2.5% speedup at speed 3 with BD-rate near +0.08%. Whether
+the resulting ratio clears 25 is the open question and the reason to run it.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..fdfbfd9 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -536,6 +536,28 @@ static void set_good_speed_features_framesize_independent(
+     sf->tpl_sf.subpel_force_stop = QUARTER_PEL;
+     sf->tpl_sf.search_method = DIAMOND;
+ 
++    // Promote the speed-4 warp search pattern to speed 3.
++    //
++    // The 101-feature study measured warp_search_method = WARP_SEARCH_DIAMOND
++    // at speed 4 at +1.65% time for +0.08% BD-rate, ratio 20.6 against a bar of
++    // 20 -- a genuine pass, and the only one of the three genuine speed-4
++    // passes not yet promoted. The other two, transform-statistics pruning and
++    // DC-block prediction, were promoted to speed 3 and returned +6.12% and
++    // +3.08%, both at or above their speed-4 measurements.
++    //
++    // That direction is expected rather than lucky: a pattern-reduction feature
++    // saves more where the search it replaces is deeper, and speed 3 searches
++    // warp parameters harder than speed 4. The same scaling appeared in the
++    // combined runs on this branch, where an identical patch set gained +30.7%
++    // at speed 2 against +20.3% at speed 4 for near-identical BD-rate.
++    //
++    // This is the thinnest of the three margins: 20.6 measured against a
++    // speed-3 bar of 25. If time and BD-rate scale together on promotion -- as
++    // they roughly did for tx-stat pruning, whose ratio fell 49.0 -> 34.0 -- the
++    // ratio barely moves and this fails. It clears only if the extra warp
++    // search at speed 3 is disproportionately redundant.
++    sf->mv_sf.warp_search_method = WARP_SEARCH_DIAMOND;
++
+     sf->tx_sf.adaptive_tx_type_search_idx = boosted ? 4 : 5;
+     sf->tx_sf.adaptive_tx_partition_type_search_idx = boosted ? 4 : 5;
+     sf->tx_sf.tx_type_search.use_skip_flag_prediction = 2;

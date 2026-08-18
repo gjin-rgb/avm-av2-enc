@@ -1,0 +1,63 @@
+Patch 13: use the speed-4 DC-block-prediction level at speed 3.
+
+Standalone. Supersedes GPT patch 0002 (which set level 1); apply INSTEAD of it.
+
+GPT 0002 promoted dc_blk_pred_level = 1 from speed 4 to speed 3 and measured
++3.08% average speedup at +0.00% BD-rate -- a ratio near 308 against a speed-3
+bar of 25, more than twelve times the required headroom. That is the largest
+unclaimed margin anywhere in the current results.
+
+Level 2 is what speed 4 already runs, so this is not a new operating point for
+the encoder, only a new preset for an existing one. The difference is that
+level 2 also applies DC-block prediction during winner-mode evaluation, not
+only outside it.
+
+Why this is the best remaining bet: the feature's measured BD-rate cost at
+level 1 was 0.00%, and at level 2 on speed 4 it was +0.04% (ratio 77.0). Both
+are far below the level at which the bar binds, so the plausible range of
+outcomes is dominated by how much additional time level 2 saves rather than by
+quality risk.
+
+The honest caveat is the one this branch has now learned twice. Loosening a
+comfortably-passing threshold worked for transform-partition stationarity
+pruning (ratio 23.6 -> 26.7 with speedup up 54%) and then failed at the very
+next step (down to 14.7). Large headroom makes a step likely to succeed, it
+does not make it safe. -DAVM_S3_DC_BLK_PRED_LEVEL=1 restores the measured
+level-1 operating point exactly, with no patch edit.
+
+Expected direction: more speedup than 0002's +3.08%, BD-rate still small but no
+longer exactly zero.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..c0e3f38 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -555,6 +555,28 @@ static void set_good_speed_features_framesize_independent(
+     // For screen content, "prune_sgr_based_on_wiener = 2" cause large quality
+     // loss.
+     sf->lpf_sf.disable_loop_restoration_chroma = boosted ? 0 : 1;
++
++    // Use the speed-4 DC-block predictor level at speed 3.
++    //
++    // The 101-feature study measured dc_blk_pred_level = 2 at speed 4 as one of
++    // the most efficient features in the encoder: +3.08% time for +0.04%
++    // BD-rate, ratio 77.0 against a bar of 20. Promoting the *conservative*
++    // level 1 to speed 3 then measured +3.08% for +0.00% BD-rate -- a ratio of
++    // roughly 308 against a speed-3 bar of 25, which is more than twelve times
++    // the headroom the feature is required to have.
++    //
++    // Headroom that large is unclaimed speedup. Level 2 is what speed 4 already
++    // runs, so this is not a new operating point for the encoder, only a new
++    // preset for an existing one: it additionally enables DC-block prediction
++    // during winner-mode evaluation rather than only outside it.
++    //
++    // Level 1 measured ~0.00% BD-rate, so the marginal cost of the extra
++    // prediction is the only unknown. Build with -DAVM_S3_DC_BLK_PRED_LEVEL=1
++    // to fall back to the measured level-1 operating point exactly.
++#ifndef AVM_S3_DC_BLK_PRED_LEVEL
++#define AVM_S3_DC_BLK_PRED_LEVEL 2
++#endif
++    sf->winner_mode_sf.dc_blk_pred_level = AVM_S3_DC_BLK_PRED_LEVEL;
+   }
+ 
+   if (speed >= 4) {

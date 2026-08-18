@@ -1,0 +1,76 @@
+Patch 15: promote transform-statistics pruning to speed 2.
+
+Standalone. Independent of GPT patch 0001 (which promotes the same feature to
+speed 3); the two compose, since this adds the assignment at speed 2 and speed
+features cascade upward.
+
+This feature is the only one in the set measured at two presets:
+
+    speed 4   +4.90% time / +0.10% BD   ratio 49.0   (bar 20)  PASS
+    speed 3   +6.12% time / +0.18% BD   ratio 34.0   (bar 25)  PASS
+
+The speedup grew as the preset slowed, which is what a pruning feature should
+do: the deeper the search it replaces, the more work it removes. Speed 2 is
+deeper still.
+
+I want to be explicit that I expect this arm to FAIL, and it is worth running
+anyway.
+
+The ratio fell from 49.0 to 34.0 across the first promotion, so BD-rate grew
+faster than time saving did. A second promotion of similar character lands
+around 25, while the speed-2 bar rises to 30. Extrapolating two points to a
+third is exactly the reasoning that failed on this branch when the
+stationarity margin was loosened a third time and collapsed from 26.7 to 14.7.
+
+It is still worth one arm. The extrapolation assumes the two quantities keep
+their ratio of growth, and they need not: the transform-type search at speed 2
+is not merely a deeper version of speed 3's, it evaluates a wider type set, and
+statistics-based pruning may remove proportionally more of it. That is a real
+mechanism, not wishful arithmetic, and no cheaper experiment can settle it.
+
+Run it as its own arm and expect to learn where the promotion curve turns over
+rather than to win. -DAVM_S2_PRUNE_TX_STATS=0 disables it without a patch edit.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..741d095 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -211,6 +211,38 @@ static void set_good_speed_feature_framesize_dependent(
+     }
+   }
+ 
++  if (speed >= 2) {
++    // Promote transform-statistics pruning from speed 4 to speed 2.
++    //
++    // This feature has now been measured at two presets. At speed 4 it gave
++    // +4.90% time for +0.10% BD-rate (ratio 49.0); promoted to speed 3 it gave
++    // +6.12% for +0.18% (ratio 34.0). Both clear their bars, and the speedup
++    // grew as the preset slowed, which is the expected behaviour for a pruning
++    // feature: the deeper the search it replaces, the more it removes.
++    //
++    // Speed 2 is the deepest search of the three, so the speedup should grow
++    // again. The question is whether it grows faster than the BD-rate cost,
++    // because the bar also rises, from 25 at speed 3 to 30 at speed 2.
++    //
++    // The trend is not encouraging on its own: the ratio already fell from 49.0
++    // to 34.0 on the first promotion, so BD-rate has been growing faster than
++    // time saving. A second promotion of the same size would land near 25,
++    // under the speed-2 bar of 30. This arm is worth running anyway because the
++    // extrapolation rests on two points and the underlying quantities need not
++    // be linear -- but it should be expected to fail, and it is cheap to
++    // discover.
++    //
++    // -DAVM_S2_PRUNE_TX_STATS=0 disables the promotion without a patch edit.
++#ifndef AVM_S2_PRUNE_TX_STATS
++#define AVM_S2_PRUNE_TX_STATS 1
++#endif
++#if AVM_S2_PRUNE_TX_STATS
++    if (is_480p_or_larger) {
++      sf->tx_sf.tx_type_search.prune_tx_type_using_stats = 1;
++    }
++#endif
++  }
++
+   if (speed >= 4) {
+     if (is_720p_or_larger) {
+       sf->part_sf.partition_search_breakout_dist_thr = (1 << 26);
