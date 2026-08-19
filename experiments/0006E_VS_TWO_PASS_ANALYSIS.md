@@ -1,5 +1,37 @@
 # Why patch 0006e collapsed on the two-pass base
 
+> **CORRECTION, added after the ea89c216 result.**
+>
+> Rebased onto `ea89c216` -- two commits after `45dc128163`, neither of which
+> touches partition search -- 0006e measures **A1 +2.96% / 0.11% (ratio 26.9)
+> and A2 +2.81% / 0.09% (ratio 31.2)**, passing the Speed-4 bar of 20 on both
+> classes. Against `45dc128163` it measured +0.73% / +1.64% and failed both.
+>
+> The numbers below, and the "~70% of the effect eliminated" figure this
+> document is built around, come from the `45dc128163` run. That run no longer
+> looks trustworthy:
+>
+> * the rebased patch is byte-identical on both bases (verified by 3-way apply);
+> * neither intervening commit touches `partition_search.c` or `encodeframe.c`;
+> * the base getting faster explains 1% of the A1 gap and 7% of the A2 gap;
+> * **A1's BD-rate is identical on both (0.11%) while its speedup quadrupled** --
+>   and a patch making the same decisions cannot save four times the work.
+>
+> **What survives:** the three mechanisms in sections 2-4 are read from source
+> and remain correct. The wet pass really does set `forced_partition` for every
+> block of 32x32 and larger, so 0006e really is a no-op there; the size grading
+> really does point away from where the dry pass works; the frame gate really
+> does anti-correlate with two-pass being inter-only.
+>
+> **What does not survive:** the *magnitude* attributed to them, and therefore
+> the conclusion in section 8 that 0006e should be retired. On the ea89c216
+> numbers 0006e is the first 06 variant ever to clear the bar on both classes.
+> Treat section 8 as suspended pending a repeat measurement, not as a finding.
+>
+> The decisive experiment is one arm: re-run 0006e on `45dc128163`. If the
+> number moves, it was measurement. See the end of this document.
+
+
 Analysis of `0006e-orientation-pruning-size-graded` against
 `45dc128163` ("Two-pass superblock partition search", #5253), which replaced
 `d6b40b7893` as the anchor.
@@ -193,3 +225,66 @@ retuning of it.
 I can build (a) and (c) against `45dc128163` on request. Note that 0006e itself
 no longer applies cleanly to that commit (`partition_search.c:5533` conflicts),
 so both would be authored fresh against the new base rather than rebased.
+
+
+---
+
+## 9. Addendum: the ea89c216 result and what it means
+
+    45dc128163   A1 +0.73% / 0.11%  ratio  6.6    A2 +1.64% / 0.15%  ratio 10.9
+    ea89c216     A1 +2.96% / 0.11%  ratio 26.9    A2 +2.81% / 0.09%  ratio 31.2
+
+Two commits apart: `d8b1854` (refactor ccso search) and `ea89c21` (fast warp
+delta search). Neither touches partition search.
+
+### Ruling out the mechanical explanations
+
+**The patch is the same.** Applying 0006e with `--3way` to each base produces a
+byte-identical 302-line diff. 0006e conflicts on both (`partition_search.c`),
+but the resolution is forced and identical, because nothing between the two
+commits touches the file.
+
+**Base rescaling does not explain it.** `ea89c21` reports its own speedup as A1
++2.4%, A2 +4.7%. If 0006e's absolute saving were unchanged, its percentage would
+scale by 1/(1-f):
+
+    A1: 0.73% -> 0.75% predicted, 2.96% observed   (explains 1% of the gap)
+    A2: 1.64% -> 1.72% predicted, 2.81% observed   (explains 7% of the gap)
+
+To explain the A1 result by rescaling alone the base would have to have become
+75% faster, and A2's would need 42% -- different amounts, from two commits that
+report a few percent.
+
+**The BD-rate is the tell.** BD-rate is a function of the encode decisions. On
+A1 it is identical across the two bases (0.11% and 0.11%) while the measured
+time saving quadrupled. A patch making the same decisions cannot save four
+times the work. On A2 the BD-rate did move (0.15% -> 0.09%), so some decisions
+genuinely changed there -- plausibly because the warp change alters mode costs
+and therefore which blocks the orientation test fires on -- and A2's speedup
+ratio moved less (1.7x against A1's 4.1x). The two classes are consistent with
+A2 containing a partly real effect and A1 being dominated by measurement error.
+
+### The insight worth keeping
+
+The uncertainty band on this cluster's EncTime is wider than the effect being
+measured. That is the same failure that has now bitten this project three
+times: round-1 wall-clock screening with a 3.5% minimum detectable effect, the
+101-feature study's +-1% floor with a sign-flipping per-preset bias, and now a
+2.2-percentage-point swing across a change that touches none of the relevant
+code.
+
+Every conclusion in this project that rests on a single timing run should be
+treated as provisional, including the ones I have written confidently.
+
+### Recommended next steps
+
+1. **Re-run 0006e on `45dc128163`.** One arm. If it reproduces 0.73%, something
+   real happened between the commits and it is worth finding. If it comes back
+   near 2.96%, the first run was wrong and 0006e is alive.
+2. **Characterise the cluster.** Run the *same* configuration twice and report
+   the spread. Every ratio in this project is a quotient whose denominator's
+   uncertainty has never been measured. This is one job and it makes every
+   future result interpretable.
+3. **Do not retire 0006e yet.** On the ea89c216 numbers it clears the bar on
+   both classes -- something no 06 variant has done, including 06c which passed
+   only A1. If that number holds, 0006e is finished work rather than a dead end.
