@@ -1,0 +1,77 @@
+Patch 18: promote the exhaustive-motion-search threshold to speed 1.
+
+Standalone. Composes with patch 17.
+
+The 101-feature study measured this feature at +7.23% time for +0.12% BD-rate,
+ratio 60.3 against a speed-2 bar of 30 -- twice the headroom it needs. It is one
+of only three high-ratio speed-2 features that has never been promoted, the
+other two having been taken to speed 1 by patches P11 (CCSO early termination,
++22.37%) and P14 (WienerNS refinement, +2.78%), both of which passed.
+
+Why this is deliberately a marginal arm. Promotion has reduced the ratio at
+every measurement so far, because BD-rate grows faster than time saved:
+transform-statistics pruning fell from 49.0 at speed 4 to 34.0 at speed 3, a
+factor of 0.69. Applying that factor here gives 60.3 x 0.69 = 41.6 against a
+speed-1 bar of 35. It clears, but not comfortably, and one more degradation
+step of the same size would not.
+
+That is the reason to run it. The promotion frontier has paid six times out of
+seven and will stop paying somewhere; this arm is close enough to the edge to
+locate it. A pass extends the frontier by one more feature, and a failure is the
+more valuable result, because it tells us where to stop spending arms on the
+mechanism that has otherwise dominated this project.
+
+One structural note. This is a straight assignment move, not a new conditional.
+Patch P10 tried a "leaf" variant of this same feature -- adding a per-block gate
+-- and came back 1.6-1.7% SLOWER. That is the consistent pattern: across both
+patch sets, every patch that ADDED a conditional to a hot path (0012, P09, P10,
+P12, and 0016's removal set) failed to deliver speed and four were outright
+slower, while every patch that MOVED an existing assignment to a slower preset
+delivered. Assignment moves cost nothing at runtime; conditionals are evaluated
+on every block whether or not they fire.
+
+-DAVM_S1_EXH_MV_THRESH=0 disables the promotion without a patch edit.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..262f728 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -339,6 +339,38 @@ static void set_good_speed_features_framesize_independent(
+   sf->rd_sf.perform_coeff_opt = 1;
+ 
+   if (speed >= 1) {
++    // Promote the exhaustive-motion-search threshold to speed 1.
++    //
++    // The 101-feature study measured this as one of the most efficient features
++    // in the encoder: +7.23% time for +0.12% BD-rate, ratio 60.3 against a
++    // speed-2 bar of 30 -- twice the required headroom.
++    //
++    // Speed 1's bar is 35. Promotion has reduced the ratio every time it has
++    // been measured (transform-statistics pruning went 49.0 -> 34.0, a factor
++    // of 0.69), so the arithmetic here is genuinely tight: 60.3 x 0.69 = 41.6,
++    // which clears 35 but not by much. This arm is worth running precisely
++    // because it sits near the point where the promotion frontier stops paying,
++    // and knowing where that is matters more than any single result.
++    //
++    // Note this is a straight assignment move, not a new conditional. Patch P10
++    // tried a "leaf" variant of the same feature -- an added per-block gate --
++    // and came back 1.6-1.7% SLOWER. Every gate-adding patch tried on this
++    // project has cost time; every assignment move has been free. This is the
++    // free kind.
++    //
++    // -DAVM_S1_EXH_MV_THRESH=0 disables the promotion without a patch edit.
++#ifndef AVM_S1_EXH_MV_THRESH
++#define AVM_S1_EXH_MV_THRESH 1
++#endif
++#if AVM_S1_EXH_MV_THRESH
++    if (cpi->twopass.fr_content_type == FC_HIGHMOTION ||
++        cpi->is_screen_content_type) {
++      sf->mv_sf.exhaustive_searches_thresh = (1 << 21);
++    } else {
++      sf->mv_sf.exhaustive_searches_thresh = (1 << 26);
++    }
++#endif
++
+     sf->flexmv_sf.prune_non_one_pel_mv_using_best_mv_prec = 1;
+     sf->inter_sf.selective_ref_frame = 2;
+     sf->inter_sf.prune_newmv_modes_using_prior_rd = 1;

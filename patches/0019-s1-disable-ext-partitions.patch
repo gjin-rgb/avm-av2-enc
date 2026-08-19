@@ -1,0 +1,58 @@
+Patch 19: promote extended-partition disabling to speed 1.
+
+Standalone. Composes with patches 17 and 18.
+
+The 101-feature study measured this as the second-largest single time saver in
+the encoder: +20.84% for +0.39% BD-rate, ratio 53.4 against a speed-2 bar of 30.
+Only CCSO early termination saves more, and that has already been promoted to
+speed 1 by patch P11, returning +22.37%.
+
+This is a marginal arm and should be run expecting either outcome. Speed 1's bar
+is 35. The one feature measured at two presets degraded by a factor of 0.69 on
+promotion (transform-statistics pruning, 49.0 -> 34.0); applying that here gives
+53.4 x 0.69 = 36.8, clearing 35 by under two points.
+
+It is worth the arm because of the magnitude behind it. A feature worth +20.84%
+is worth testing even at a marginal ratio. If it passes it is the largest single
+gain left on the promotion frontier. If it fails it will fail with a large
+speedup attached, and the BD-rate cost then tells us what extended partitions
+are actually worth at speed 1 -- a number nobody currently has, and one that
+bounds every future partition-pruning idea at that preset.
+
+Patch P12 tried a "leaf" variant of this same feature at speed 1 and came back
+1.1-1.5% SLOWER, because it added a per-block conditional. This patch moves an
+assignment and adds no runtime test. That distinction has now decided every
+patch on this project: across both patch sets, five patches that added
+conditionals to hot paths delivered no speed and four were outright slower,
+while six of seven assignment promotions passed.
+
+-DAVM_S1_DISABLE_EXT_PART=0 disables the promotion without a patch edit.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..a6ad83f 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -348,6 +348,23 @@ static void set_good_speed_features_framesize_independent(
+     // TODO (Yeqing Wu): need to be tuned for speed > 1.
+     sf->inter_sf.skip_compound_prune_top_refs_num_ref0 = 1;
+     sf->inter_sf.skip_compound_prune_top_refs_num_ref1 = 2;
++    // Promote extended-partition disabling to speed 1. See the patch header:
++    // the 101-feature study measured this at +20.84% for +0.39% BD-rate (ratio
++    // 53.4 vs a speed-2 bar of 30), the second-largest single time saver in the
++    // encoder. Speed 1's bar is 35 and the observed promotion degradation
++    // factor (x0.69) puts this at ~36.8, so it is a deliberately marginal arm
++    // run for the magnitude behind it. A straight assignment move, not a new
++    // conditional -- P12's "leaf" variant of this feature added a per-block gate
++    // and came back 1.1-1.5% slower.
++    //
++    // -DAVM_S1_DISABLE_EXT_PART=0 disables the promotion without a patch edit.
++#ifndef AVM_S1_DISABLE_EXT_PART
++#define AVM_S1_DISABLE_EXT_PART 1
++#endif
++#if AVM_S1_DISABLE_EXT_PART
++    sf->part_sf.disable_ext_partitions = true;
++#endif
++
+     sf->inter_sf.reduce_comp_refs = 2;
+     sf->inter_sf.disable_switchable_refinemv = 1;
+     sf->inter_sf.prune_refinemv_by_ref_idx = 1;
