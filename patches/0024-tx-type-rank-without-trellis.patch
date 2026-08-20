@@ -1,0 +1,125 @@
+Patch 24: rank transform types with the cheap quantiser, not the trellis.
+
+Standalone, against anchor 5d628d8 (current origin/av2-enc).
+
+VERIFICATION STATUS, STATED UP FRONT: I could NOT make this fire on my test
+clip. On 192x128, 2 frames, cpu-used=4 the output was bit-identical to baseline
+(md5 c2a7fb30... both ways) and the runtime unchanged. That is the same
+signature I have criticised in other patches, so treat the speedup claim below
+as unverified.
+
+The reason is likely scale rather than gating. The two call sites are reached
+only when cpi->sf.tx_sf.tx_type_search.prune_tx_type_est_rd is set -- a speed-4
+feature, so enabled in that run -- AND num_allowed > 2, i.e. more than two
+transform types survive earlier pruning. On a 192x128 clip at qp=135 there are
+few coefficients and few surviving types. On 4K CTC content num_allowed > 2
+should be common. That is a hypothesis; the CTC run is what settles it, and if
+the arm comes back bit-identical the patch is a no-op and should be dropped
+rather than tuned.
+
+THE FINDING BEHIND IT. A callgrind profile of the current encoder at cpu-used=4
+puts trellis quantisation at about 47% of all instructions retired:
+
+    av2_trellis_quant                     9.95%
+    av2_decide_states_q1_avx2             7.47%
+    av2_decide_states_avx2                5.86%
+    av2_optimize_txb_new                  3.72%
+    av2_get_rate_dist_def_luma_q1_avx2    3.31%
+    av2_update_states_avx2                3.28%
+    av2_get_rate_dist_def_luma_avx2       3.17%
+    av2_find_best_path_avx2               2.89%
+    av2_update_nbr_diagonal_avx2          2.86%
+    av2_optimize_fsc_block                2.51%
+                                         -------
+                                         ~47%
+
+For comparison, the forward transform is 6.2%, coefficient rate estimation
+3.6%, and transform-type search 2.0%. Quantisation is larger than partition
+search, mode search and the loop filters combined, and every patch produced on
+this project so far has attacked something else.
+
+av2_trellis_quant contains ZERO speed-feature references. It runs at full
+strength at every preset and at every stage of the search, including inside
+loops whose only purpose is to order candidates.
+
+THE CHANGE. prune_txk_type and prune_txk_type_separ are transform-type RANKING
+loops: they evaluate candidates only to order them into txk_map, after which
+the survivors are re-evaluated properly. Both passed a literal 1 for
+use_optimize_b, forcing the trellis on for every candidate, independently of the
+skip_trellis decision that every other av2_setup_quant call site in the file
+honours. This patch passes 0 instead, so ranking uses the cheap quantiser while
+the real decision still uses the trellis.
+
+The structural argument is the same one the two-pass partition search made for
+shapes: rank cheaply, decide properly. Both paths return a rate and a distortion
+for the same transform, so the ordering signal survives; what is skipped is the
+state-space search that only matters once a type has been chosen.
+
+-DAVM_TX_RANK_TRELLIS=1 restores the original behaviour exactly.
+
+diff --git a/av2/encoder/tx_search.c b/av2/encoder/tx_search.c
+index 593fd92..6042445 100644
+--- a/av2/encoder/tx_search.c
++++ b/av2/encoder/tx_search.c
+@@ -1253,8 +1253,46 @@ uint16_t prune_txk_type_separ(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
+   QUANT_PARAM quant_param;
+   TxfmParam txfm_param;
+   av2_setup_xform(cm, x, plane, tx_size, DCT_DCT, CCTX_NONE, &txfm_param);
+-  av2_setup_quant(tx_size, 1, AV2_XFORM_QUANT_B, cpi->oxcf.q_cfg.quant_b_adapt,
+-                  &quant_param);
++  // Rank transform types with the cheap quantiser, not the trellis.
++  //
++  // A callgrind profile of the current encoder (cpu-used=4) puts trellis
++  // quantisation at ~47% of all instructions retired -- by far the largest
++  // single component, and larger than partition search, mode search and the
++  // loop filters combined:
++  //
++  //     av2_trellis_quant                    9.95%
++  //     av2_decide_states_q1_avx2            7.47%
++  //     av2_decide_states_avx2               5.86%
++  //     av2_optimize_txb_new                 3.72%
++  //     av2_get_rate_dist_def_luma_q1_avx2   3.31%
++  //     av2_update_states_avx2               3.28%
++  //     av2_get_rate_dist_def_luma_avx2      3.17%
++  //     av2_find_best_path_avx2              2.89%
++  //     (plus av2_update_nbr_diagonal_avx2, av2_optimize_fsc_block)
++  //
++  // av2_trellis_quant contains no speed-feature references at all, so it runs
++  // at full strength at every preset and at every stage of the search.
++  //
++  // This call site and its twin below are transform-type RANKING loops: they
++  // evaluate the candidate types only to order them into txk_map, after which
++  // the survivors are re-evaluated properly. Both passed a literal 1 for
++  // use_optimize_b, forcing the trellis on for all sixteen candidates,
++  // independently of the skip_trellis decision every other call site in this
++  // file honours.
++  //
++  // Running the encoder's most expensive tool at full strength inside a pass
++  // that only sorts candidates is the same structural mistake the two-pass
++  // partition search fixed for shapes: rank cheaply, then decide properly. The
++  // cheap quantiser keeps the ordering signal -- both paths return a rate and
++  // distortion for the same transform -- while skipping the state-space search
++  // that only matters once a type has been chosen.
++  //
++  // -DAVM_TX_RANK_TRELLIS=1 restores the original behaviour.
++#ifndef AVM_TX_RANK_TRELLIS
++#define AVM_TX_RANK_TRELLIS 0
++#endif
++  av2_setup_quant(tx_size, AVM_TX_RANK_TRELLIS, AV2_XFORM_QUANT_B,
++                  cpi->oxcf.q_cfg.quant_b_adapt, &quant_param);
+   int tx_type;
+   // to ensure we can try ones even outside of ext_tx_set of current block
+   // this function should only be called for size < 16
+@@ -1366,8 +1404,10 @@ uint16_t prune_txk_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
+   TxfmParam txfm_param;
+   QUANT_PARAM quant_param;
+   av2_setup_xform(cm, x, plane, tx_size, DCT_DCT, CCTX_NONE, &txfm_param);
+-  av2_setup_quant(tx_size, 1, AV2_XFORM_QUANT_B, cpi->oxcf.q_cfg.quant_b_adapt,
+-                  &quant_param);
++  // Second transform-type ranking loop; see the comment on the first for why
++  // the trellis is skipped here. Same switch governs both.
++  av2_setup_quant(tx_size, AVM_TX_RANK_TRELLIS, AV2_XFORM_QUANT_B,
++                  cpi->oxcf.q_cfg.quant_b_adapt, &quant_param);
+ 
+   for (int idx = 0; idx < TX_TYPES; idx++) {
+     tx_type = idx;

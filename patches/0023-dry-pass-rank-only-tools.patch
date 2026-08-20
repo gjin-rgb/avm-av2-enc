@@ -1,0 +1,135 @@
+Patch 23: reduce the two-pass dry pass to the tools that actually rank shapes.
+
+Standalone, against anchor 5d628d8 (current origin/av2-enc). Three independent
+changes to the DryPassCfg initialiser in av2_rd_pick_inter_mode_sb, each behind
+its own build-time switch so the arm decomposes by rebuild rather than by patch
+edit.
+
+VERIFICATION STATUS: confirmed to change the encode. On a 192x128 2-frame clip
+at cpu-used=4 the bitstream md5 differs from baseline (615ff9e8... vs
+c2a7fb30..., 6985 vs 6996 bytes). Local runtime was flat, but that clip is one
+key frame plus one inter frame and two-pass is inter-only, so the key frame
+dominates the measurement. The magnitude needs CTC.
+
+WHY THE DRY PASS. The two-pass superblock partition search (#5253) added a
+first "dry" pass whose stated job is to "work out a rough partition shape ...
+because it only has to rank shapes against each other, not produce the final
+coding decision". Its tool reduction is expressed as a DryPassCfg struct with
+about eighteen hard-coded caps. Nothing in this project has ever tuned them,
+and three of them are doing more work than ranking requires.
+
+(1) WARP MODES. cfg->motion_mode_mask restricts the dry pass to
+SIMPLE_TRANSLATION, but a few hundred lines below there is an escape hatch:
+
+    if (base_mbmi.mode == WARPMV || base_mbmi.mode == WARP_NEWMV) {
+      modes_to_search = allowed_motion_modes;     // full set
+    } else if (x->apply_dry_pass_shortcuts) {
+      modes_to_search = cfg->motion_mode_mask;    // SIMPLE_TRANSLATION
+    }
+
+The bypass is correct on its own terms -- WARPMV asserts motion_mode ==
+WARP_DELTA, so restricting it would produce an invalid prediction -- but it
+means these two modes are the only ones in the dry pass running the FULL motion
+mode set, including WARP_DELTA and its nested trial loops. Every other mode
+gets a single translation trial. The dry pass's most expensive inner loops
+belong to the two modes its own reduction cannot reach. Removing them from
+inter_mode_mask closes the hatch from the other side.
+
+(2) MV PRECISION 3 -> 1. Each extra precision re-runs the motion search at a
+finer step, shifting the MV cost of every candidate shape in the same
+direction, so the shape ranking is largely invariant to it.
+
+(3) WEDGE DROPPED. Wedge search partitions a block into two soft-bounded
+regions -- itself a shape decision, evaluated inside a pass whose only job is
+choosing the block shape, and the partition shapes being ranked already express
+that split. It is also the expensive member of the mask.
+
+In all three cases the wet pass still runs the full tool on the surviving
+shape, so what is given up is ranking fidelity, not final coding quality. That
+is the trade the dry pass was built to make; these changes take it further in
+the direction it already chose.
+
+Switches, all defaulting to the new behaviour:
+
+    -DAVM_DRY_PASS_WARP_MODES=1    restore warp modes
+    -DAVM_DRY_PASS_PRECISIONS=3    restore three precisions
+    -DAVM_DRY_PASS_WEDGE=1         restore wedge
+
+Setting all three restores the current encoder exactly, which makes both the
+fallback and the per-change attribution free.
+
+diff --git a/av2/encoder/rdopt.c b/av2/encoder/rdopt.c
+index c6d5434..5c8169a 100644
+--- a/av2/encoder/rdopt.c
++++ b/av2/encoder/rdopt.c
+@@ -9166,11 +9166,66 @@ void av2_rd_pick_inter_mode_sb(struct AV2_COMP *cpi,
+       .intra_fsc_cap = 0,
+       .intra_mrl_cap = 0,
+       .motion_mode_mask = (1u << SIMPLE_TRANSLATION),
+-      .compound_type_mask = (1u << COMPOUND_AVERAGE) | (1u << COMPOUND_WEDGE),
++      // (3) Wedge dropped from the dry pass. Wedge search partitions a block
++      // into two regions with a soft boundary -- itself a shape decision, made
++      // inside a pass whose only job is choosing the block shape. The partition
++      // shapes being ranked already express the same directional split. Wedge
++      // is also the expensive member of the mask, iterating wedge indices with
++      // a compound-type RD per candidate where COMPOUND_AVERAGE is one blend.
++      // The wet pass still searches wedge on the winning shape.
++#ifndef AVM_DRY_PASS_WEDGE
++#define AVM_DRY_PASS_WEDGE 0
++#endif
++      .compound_type_mask = (1u << COMPOUND_AVERAGE)
++#if AVM_DRY_PASS_WEDGE
++                            | (1u << COMPOUND_WEDGE)
++#endif
++      ,
++      // (1) Warp prediction modes excluded from the dry pass.
++      //
++      // The dry pass reduces motion modes to SIMPLE_TRANSLATION through
++      // cfg->motion_mode_mask, but that reduction has an escape hatch:
++      //
++      //   if (base_mbmi.mode == WARPMV || base_mbmi.mode == WARP_NEWMV) {
++      //     modes_to_search = allowed_motion_modes;     // full set
++      //   } else if (x->apply_dry_pass_shortcuts) {
++      //     modes_to_search = cfg->motion_mode_mask;    // SIMPLE_TRANSLATION
++      //   }
++      //
++      // The bypass is correct on its own terms: WARPMV asserts
++      // motion_mode == WARP_DELTA, so forcing SIMPLE_TRANSLATION would give an
++      // invalid prediction. The consequence is that these two modes are the
++      // only ones in the dry pass that run the FULL motion mode set, including
++      // WARP_DELTA and its nested trial loops -- warp_ref_idx x
++      // warp_precision_idx for WARP_NEWMV, warp_ref_idx x warpmv_with_mvd_flag
++      // x warp_inter_intra for WARPMV. Every other mode gets a single trial.
++      // The dry pass's most expensive inner loops belong to the two modes its
++      // own tool reduction cannot reach; this closes the hatch from the other
++      // side.
++      //
++      // The dry pass ranks partition shapes rather than producing a coding
++      // decision. Warp refines the motion MODEL within a shape and improves
++      // prediction roughly uniformly across the shapes being compared, so the
++      // shape winning under warp is very likely the one winning under
++      // translation. The wet pass still searches warp on the surviving shape.
++#ifndef AVM_DRY_PASS_WARP_MODES
++#define AVM_DRY_PASS_WARP_MODES 0
++#endif
+       .inter_mode_mask = (1u << NEWMV) | (1u << NEW_NEWMV) | (1u << NEARMV) |
+-                         (1u << NEAR_NEARMV) | (1u << WARPMV) |
+-                         (1u << WARP_NEWMV),
+-      .precisions_from_top = 3,
++                         (1u << NEAR_NEARMV)
++#if AVM_DRY_PASS_WARP_MODES
++                         | (1u << WARPMV) | (1u << WARP_NEWMV)
++#endif
++      ,
++      // (2) One MV precision instead of three. Precision refinement is a
++      // within-shape refinement: each extra precision re-runs motion search at
++      // a finer step and shifts the MV cost of every candidate shape in the
++      // same direction, so the ranking is largely invariant to it. The wet pass
++      // still searches the full precision ladder on the surviving shape.
++#ifndef AVM_DRY_PASS_PRECISIONS
++#define AVM_DRY_PASS_PRECISIONS 1
++#endif
++      .precisions_from_top = AVM_DRY_PASS_PRECISIONS,
+       .intra_mpm_cap = 13,
+     };
+     // Keep the normal distortion measure; a cheaper one made the partition
