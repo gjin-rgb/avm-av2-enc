@@ -1,0 +1,69 @@
+Patch 22: disable extended partitions at speed 1, on 1080p and below only.
+
+Standalone. The conservative reading of patch 0019's split result -- included as
+the floor of this round rather than its ambition.
+
+0019 cleared the bar on A2 (1080p) at ratio 37.9 with +22.75% speedup, and
+missed on A1 (4K) at 30.6. Both-classes-must-pass disqualified it. This patch
+scopes the feature to the class where it already qualifies, banking the measured
+1080p win and leaving 4K exactly as it is.
+
++22.75% is the second-largest single speedup measured anywhere in this project,
+behind only the CCSO early-termination promotion. Declining to ship it because
+it also fails on a class it can simply be scoped away from would be leaving a
+large, verified gain on the table for no benefit.
+
+Patches 20 and 21 attempt the harder thing -- making the feature qualify at 4K
+too, by gating on pyramid level and by splitting the extended-partition family
+respectively. If either succeeds it supersedes this patch and should be
+preferred, since a feature that works at both resolutions is worth more than one
+scoped to half the test set. This patch is what to land if both fail.
+
+Resolution-conditioned speed features are idiomatic in this file --
+is_480p_or_larger and is_720p_or_larger already gate several assignments -- so
+this introduces no new kind of dependency, only a new instance of an existing
+one.
+
+The 2560 threshold puts 1080p and below inside the feature and 4K outside it.
+-DAVM_S1_EXT_PART_MAX_WIDTH=0 disables the promotion entirely; raising the value
+widens the scope back toward 0019.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..4e8a265 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -349,6 +349,34 @@ static void set_good_speed_features_framesize_independent(
+     sf->inter_sf.skip_compound_prune_top_refs_num_ref0 = 1;
+     sf->inter_sf.skip_compound_prune_top_refs_num_ref1 = 2;
+     sf->inter_sf.reduce_comp_refs = 2;
++    // Disable extended partitions at speed 1 on 1080p and below only.
++    //
++    // This is the conservative reading of patch 0019's split result. It cleared
++    // the bar on A2 (1080p) at ratio 37.9 with +22.75% speedup and missed on A1
++    // (4K) at 30.6. Rather than trying to recover A1, this scopes the feature to
++    // the class where it already qualifies, banking a large measured win at
++    // 1080p and leaving 4K untouched.
++    //
++    // It is included as the floor of this round, not its ambition. Patches 20
++    // and 21 attempt to make the feature work at 4K as well, and if either
++    // succeeds it supersedes this. If both fail, this still ships +22.75% on
++    // 1080p, which is the second-largest single speedup measured anywhere in
++    // this project.
++    //
++    // Resolution-conditioned speed features are idiomatic in this file --
++    // is_480p_or_larger and is_720p_or_larger already gate several -- so this
++    // introduces no new kind of dependency.
++    //
++    // -DAVM_S1_EXT_PART_MAX_WIDTH=0 disables the promotion entirely.
++#ifndef AVM_S1_EXT_PART_MAX_WIDTH
++#define AVM_S1_EXT_PART_MAX_WIDTH 2560
++#endif
++#if AVM_S1_EXT_PART_MAX_WIDTH
++    if (cm->width < AVM_S1_EXT_PART_MAX_WIDTH) {
++      sf->part_sf.disable_ext_partitions = true;
++    }
++#endif
++
+     sf->inter_sf.disable_switchable_refinemv = 1;
+     sf->inter_sf.prune_refinemv_by_ref_idx = 1;
+     sf->inter_sf.prune_interintra_by_ref_idx = 1;

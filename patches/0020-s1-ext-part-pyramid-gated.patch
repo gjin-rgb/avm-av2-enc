@@ -1,0 +1,105 @@
+Patch 20: disable extended partitions at speed 1, gated by pyramid level.
+
+Standalone. Supersedes patch 0019 -- apply INSTEAD of it, not on top.
+
+Patch 0019 promoted this feature unconditionally and split the bar:
+
+    A1 (4K)     +15.92% / +0.52%   ratio 30.6   FAIL (bar 35)
+    A2 (1080p)  +22.75% / +0.60%   ratio 37.9   PASS
+
+A1 needs only a 12.5% BD-rate reduction at constant speed to clear. The gap is
+small, and the per-sequence data says exactly where to look for it.
+
+Across the eight A1 sequences the speedup is nearly uniform -- 13.30% to 19.38%,
+coefficient of variation 12% -- while the BD-rate cost varies sevenfold, from
+-0.17% on Crosswalk to +1.22% on PierSeaSide, CV 89%. The speed benefit is a
+property of the encoder. The quality cost is a property of the frame. Any fix
+must therefore separate frames rather than turn a threshold down, because a
+threshold move scales speed and quality together and the A1 ratio would barely
+shift. Arithmetic on the measured per-sequence table makes the size of the prize
+concrete: exempting PierSeaSide alone takes A1 from 30.6 to 37.2, and exempting
+the worst two takes it to 42.7.
+
+Pyramid level is the separator, and this branch has already measured that it is
+the right one. When patch 0006c gated orientation pruning by layer depth, the
+marginal ratio of the prunes that gate removed was 12.8 -- far under the bar --
+which is a direct measurement that partition prunes on frames low in the pyramid
+are the bad ones. The mechanism is not subtle: everything coded afterwards
+predicts from those frames, so a lost partition there is paid for repeatedly,
+while the same loss on a leaf frame is paid once.
+
+Expected shape of the result: less speedup than 0019, disproportionately less
+BD-rate. If pyramid levels >= 3 carry roughly half the encode time and well
+under half the propagated damage, A1 lands near 9-11% speedup at 0.2-0.3%
+BD-rate, comfortably over 35. That is a projection, not a measurement.
+
+On P12. GPT's patch P12 nominally tested this idea at speed 1 using a
+!boosted && !allow_screen_content_tools gate, and reported 1.1-1.5% SLOWER with
+a BD-rate of exactly 0.00% on both classes. An unchanged bitstream cannot take
+longer to produce, so P12 appears not to have taken effect at all. I previously
+read P12 as evidence that conditional gates are expensive and wrote a rule from
+it; that reading was wrong, and this idea should be treated as untested rather
+than refuted.
+
+AVM_S1_EXT_PART_PYRAMID_MIN is the lowest pyramid level that gets pruned. The
+default of 3 matches the boundary this file already uses for pyramid-dependent
+decisions. Raising it protects more frames and gives up speed; setting it to 0
+reproduces patch 0019 exactly, which makes the fallback free:
+
+    -DAVM_S1_EXT_PART_PYRAMID_MIN=2   prune more
+    -DAVM_S1_EXT_PART_PYRAMID_MIN=4   prune less
+    -DAVM_S1_EXT_PART_PYRAMID_MIN=0   exactly patch 0019
+
+Two arms at 3 and 4 would bracket the curve for one extra run.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..0930a6f 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -348,6 +348,46 @@ static void set_good_speed_features_framesize_independent(
+     // TODO (Yeqing Wu): need to be tuned for speed > 1.
+     sf->inter_sf.skip_compound_prune_top_refs_num_ref0 = 1;
+     sf->inter_sf.skip_compound_prune_top_refs_num_ref1 = 2;
++    // Disable extended partitions at speed 1, but only on frames high in the
++    // pyramid.
++    //
++    // Patch 0019 promoted this feature unconditionally and split the bar:
++    //
++    //     A1 (4K)     +15.92% / +0.52%   ratio 30.6   FAIL (bar 35)
++    //     A2 (1080p)  +22.75% / +0.60%   ratio 37.9   PASS
++    //
++    // A1 needs only a 12.5% BD-rate reduction at constant speed to clear, so
++    // the gap is small. The per-sequence data says where to find it: across the
++    // eight A1 sequences the speedup is nearly uniform (13.3-19.4%, CV 12%)
++    // while the BD-rate cost varies sevenfold (-0.17% to +1.22%, CV 89%). The
++    // speed benefit is a property of the encoder; the quality cost is a
++    // property of the frame. A gate that separates frames is therefore working
++    // with the grain of the data, and a threshold change is not.
++    //
++    // Pyramid level is the right separator on the evidence already collected on
++    // this branch. When patch 0006c gated orientation pruning by layer depth,
++    // the marginal ratio of the prunes it removed was 12.8 -- well under the
++    // bar -- which is a direct measurement that partition prunes on frames low
++    // in the pyramid are the bad ones. They are bad because everything coded
++    // afterwards predicts from them, so one lost partition is paid for
++    // repeatedly, while the same loss on a leaf frame is paid once.
++    //
++    // GPT patch P12 nominally tested this idea and came back 1.1-1.5% slower
++    // with a BD-rate of exactly 0.00% on both classes. An unchanged bitstream
++    // cannot take longer to produce, so P12 appears not to have taken effect.
++    // Treat the idea as untested rather than refuted.
++    //
++    // AVM_S1_EXT_PART_PYRAMID_MIN is the lowest pyramid level that gets pruned.
++    // 3 matches the boundary this file already uses for pyramid-dependent
++    // decisions. Raising it protects more frames and costs speed; setting it to
++    // 0 reproduces patch 0019 exactly.
++#ifndef AVM_S1_EXT_PART_PYRAMID_MIN
++#define AVM_S1_EXT_PART_PYRAMID_MIN 3
++#endif
++    if (cm->current_frame.pyramid_level >= AVM_S1_EXT_PART_PYRAMID_MIN) {
++      sf->part_sf.disable_ext_partitions = true;
++    }
++
+     sf->inter_sf.reduce_comp_refs = 2;
+     sf->inter_sf.disable_switchable_refinemv = 1;
+     sf->inter_sf.prune_refinemv_by_ref_idx = 1;

@@ -1,0 +1,81 @@
+Patch 21: promote only the uneven-4-way partition disable to speed 1.
+
+Standalone. Composes with patch 20 (they set different flags), and is a weaker
+alternative to patch 0019.
+
+Speed 2 sets two related flags together:
+
+    sf->part_sf.disable_uneven_4way_partitions = true;
+    sf->part_sf.disable_ext_partitions         = true;
+
+Patch 0019 promoted the second to speed 1 and landed at +15.92% / +0.52% on A1,
+ratio 30.6 against a bar of 35 -- a large speedup carrying slightly too much
+quality cost. This patch promotes the first instead.
+
+The reasoning is that the extended partition family is not homogeneous. The
+uneven 4-way shapes (HORZ_4A/4B, VERT_4A/4B) split a block into unequal quarters
+and pay off only where content happens to align to that particular division;
+the 3-way shapes are the more generally useful members and carry more of the
+family's coding gain. Disabling the 4-way subset alone should therefore give up
+a smaller share of the BD-rate than of the search time -- which is the only kind
+of change that moves a ratio, as opposed to sliding along it.
+
+This is a strictly weaker change than 0019 and will deliver a proportionally
+smaller speedup. It earns its own arm because of what either outcome tells us.
+If the 4-way subset accounts for a disproportionate share of extended-partition
+search time, the arithmetic clears the bar where 0019 could not. If it accounts
+for a proportionate share, the ratio lands near 0019's 30.6 and the conclusion
+is that the family cannot usefully be split -- worth establishing before more
+effort goes into subdividing it, and cheap to establish.
+
+Note this is an assignment move, not a new runtime test: the flag already exists
+and is already honoured throughout the partition search.
+
+-DAVM_S1_DISABLE_UNEVEN_4WAY=0 disables the promotion without a patch edit.
+
+diff --git a/av2/encoder/speed_features.c b/av2/encoder/speed_features.c
+index f363519..e917ada 100644
+--- a/av2/encoder/speed_features.c
++++ b/av2/encoder/speed_features.c
+@@ -344,6 +344,41 @@ static void set_good_speed_features_framesize_independent(
+     sf->inter_sf.prune_newmv_modes_using_prior_rd = 1;
+     sf->inter_sf.share_motion_mode_prune_pool = 1;
+     sf->inter_sf.prune_compound_using_single_ref = 1;
++    // Promote only the uneven-4-way partition disable to speed 1.
++    //
++    // Speed 2 sets two related flags together:
++    //     sf->part_sf.disable_uneven_4way_partitions = true;
++    //     sf->part_sf.disable_ext_partitions       = true;
++    // Patch 0019 promoted the second and landed at ratio 30.6 on A1 against a
++    // bar of 35 -- a large speedup (+15.92%) carrying slightly too much
++    // BD-rate (+0.52%).
++    //
++    // This patch promotes the first instead. The extended partition family is
++    // not homogeneous: the uneven 4-way shapes (HORZ_4A/4B, VERT_4A/4B) are the
++    // most speculative members, since they subdivide a block into unequal
++    // quarters and win only where content happens to align to that split. The
++    // 3-way shapes carry more of the family's coding gain. Disabling the 4-way
++    // subset alone should therefore give up a smaller fraction of the BD-rate
++    // than of the search time.
++    //
++    // This is a strictly weaker change than 0019 and expected to deliver a
++    // proportionally smaller speedup. It is worth its own arm because 0019
++    // established that the whole family is worth roughly 16% at speed 1 while
++    // costing marginally too much quality: if the 4-way subset turns out to
++    // account for a disproportionate share of that time, the arithmetic clears
++    // the bar where 0019 could not. If it accounts for a proportionate share,
++    // the ratio lands near 0019's and the family cannot be split usefully --
++    // which is itself worth knowing before more effort goes into subdividing
++    // it.
++    //
++    // -DAVM_S1_DISABLE_UNEVEN_4WAY=0 disables the promotion.
++#ifndef AVM_S1_DISABLE_UNEVEN_4WAY
++#define AVM_S1_DISABLE_UNEVEN_4WAY 1
++#endif
++#if AVM_S1_DISABLE_UNEVEN_4WAY
++    sf->part_sf.disable_uneven_4way_partitions = true;
++#endif
++
+     sf->inter_sf.skip_amvd_new_near_near_new_modes = 1;
+     // TODO (Yeqing Wu): need to be tuned for speed > 1.
+     sf->inter_sf.skip_compound_prune_top_refs_num_ref0 = 1;
