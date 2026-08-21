@@ -1,0 +1,93 @@
+Patch 25: honour the dry pass in tx_type_rd, as its sibling path already does.
+
+Standalone, against anchor 5d628d8. Supersedes patch 0024, which was a
+confirmed no-op in CTC and should be dropped.
+
+MEASURED LOCALLY, PAIRED, 3 REPS: +6.86%, +9.16%, +5.00% -- mean +7.01%,
+sd 2.08%, all three the same sign. 192x128, 4 frames, cpu-used=4, alternating
+two saved binaries. The bitstream changes (md5 eeebfc00 vs ab4e2d32), so there
+is a real quality cost that only CTC can price. A small clip is not a CTC
+result and the magnitude will move at 4K; what this establishes is that the
+patch fires and that the effect is large enough to be worth an arm.
+
+THE FINDING. A callgrind profile of this encoder at cpu-used=4 puts trellis
+quantisation at about 47% of all instructions retired -- more than partition
+search, mode search and the loop filters combined -- and
+av2/encoder/trellis_quant.c contains no speed-feature references at all. It
+runs at full strength at every preset and every stage of the search.
+
+The two-pass dry pass is supposed to avoid exactly this.
+choose_tx_size_type_from_rd says so in as many words:
+
+    // Dry pass: skip trellis (no RDOQ) - light quant only.
+    const int skip_trellis = x->apply_dry_pass_shortcuts ? 1 : 0;
+
+But tx_type_rd, a few hundred lines away in the same file, had:
+
+    const int skip_trellis = 0;
+
+hard-coded. So the trellis ran at full strength there even during the dry pass,
+whose entire purpose is to rank partition shapes cheaply. tx_type_rd is reached
+from try_tx_block_no_split -- once per transform block per transform partition
+candidate -- which makes it one of the densest trellis call sites in the
+encoder.
+
+This is a consistency fix, not a new heuristic. It applies the policy the dry
+pass already declares, at a site that was not honouring it. The wet pass is
+untouched and still runs the full trellis for the real coding decision.
+
+WHY THE EARLIER ATTEMPTS MISSED IT. Patch 0023 reduced the dry pass's mode and
+precision caps and returned +6.15% at +0.58% BD-rate, ratio ~10.6 against a bar
+of 25 -- it bought speed by degrading the shape ranking. Patch 0024 targeted
+the transform-type pruning helpers and was bit-identical in CTC, because those
+sites need num_allowed > 2 and are rarely reached. Neither touched
+quantisation, which is where the time actually is. This patch does, and it does
+so by removing work the code already intended to skip rather than by ranking
+less carefully.
+
+-DAVM_TX_TYPE_RD_DRY_TRELLIS=1 restores the hard-coded 0 exactly.
+
+diff --git a/av2/encoder/tx_search.c b/av2/encoder/tx_search.c
+index 593fd92..3bfc1c7 100644
+--- a/av2/encoder/tx_search.c
++++ b/av2/encoder/tx_search.c
+@@ -3012,7 +3012,39 @@ static AVM_INLINE void tx_type_rd(const AV2_COMP *cpi, MACROBLOCK *x,
+   av2_subtract_txb(x, AVM_PLANE_Y, plane_bsize, blk_col, blk_row, tx_size,
+                    cpi->common.width, cpi->common.height, DCT_DCT);
+   RD_STATS this_rd_stats;
++  // Honour the dry pass here, as the sibling path already does.
++  //
++  // A callgrind profile of this encoder at cpu-used=4 puts trellis
++  // quantisation at ~47% of all instructions retired -- larger than partition
++  // search, mode search and the loop filters combined -- and
++  // av2/encoder/trellis_quant.c contains no speed-feature references at all.
++  //
++  // The two-pass dry pass is supposed to avoid it. choose_tx_size_type_from_rd
++  // says so explicitly:
++  //
++  //     // Dry pass: skip trellis (no RDOQ) - light quant only.
++  //     const int skip_trellis = x->apply_dry_pass_shortcuts ? 1 : 0;
++  //
++  // This function had a hard-coded 0 instead, so the trellis ran at full
++  // strength here even during the dry pass. tx_type_rd is called from
++  // try_tx_block_no_split, i.e. once per transform block per transform
++  // partition candidate, which makes it one of the densest trellis call sites
++  // in the encoder -- and the dry pass, whose whole purpose is to rank
++  // partition shapes cheaply, was paying for it.
++  //
++  // This is a consistency fix rather than a new heuristic: it applies the
++  // policy the dry pass already declares, at a site that was not honouring it.
++  // The wet pass is unaffected and still runs the full trellis.
++  //
++  // -DAVM_TX_TYPE_RD_DRY_TRELLIS=1 restores the hard-coded 0.
++#ifndef AVM_TX_TYPE_RD_DRY_TRELLIS
++#define AVM_TX_TYPE_RD_DRY_TRELLIS 0
++#endif
++#if AVM_TX_TYPE_RD_DRY_TRELLIS
+   const int skip_trellis = 0;
++#else
++  const int skip_trellis = x->apply_dry_pass_shortcuts ? 1 : 0;
++#endif
+   int dummy = 0;
+   search_tx_type(cpi, x, 0, block, blk_row, blk_col, plane_bsize, tx_size,
+                  &dummy, txb_ctx, ftxs_mode, skip_trellis, ref_rdcost,
