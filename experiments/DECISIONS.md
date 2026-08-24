@@ -498,3 +498,57 @@ between those regimes. Round-1 magnitudes should not be expected to transfer.
 `README.md` but not implemented. It is the highest-value remaining piece of
 infrastructure: it measures the quality cost of every pruning heuristic
 deterministically, in one encode per (clip, QP), without a CTC round.
+
+---
+
+## 2026-08-21 — `0025` results, and a correction about the 47%
+
+**`0025` came back as two near-misses at Speed 3** (A1 +3.26%/+0.14% → 23.3,
+A2 +4.23%/+0.17% → 24.9, bar 25) and a clear fail at Speed 4.
+
+**Killed: Speed 4 for the whole dry-pass family.** At Speed 4 the patch gave
+*less* speed and *more* damage than at Speed 3. Both halves have one
+explanation: a faster preset has already pruned more of the dry pass (less left
+to remove) and trusts the dry-pass ranking further through `forced_partition`
+(less downstream correction of a ranking error). **Dry-pass fidelity reductions
+get more expensive at faster presets.** That runs opposite to preset promotion
+and means this family belongs at slower presets only.
+
+**Per-sequence.** corr(speedup, BD) = −0.07 on A1, −0.20 on A2 — essentially
+independent. On A1 the three worst sequences carry 66% of the BD-rate and 35%
+of the speedup; exempting Crosswalk alone moves the aggregate from 22.8 to 29.6.
+A near-miss with concentrated, uncorrelated cost is the case where splitting
+works and where turning a threshold down does not.
+
+**Correction — "no speed feature reaches the trellis" was wrong.** The profile
+finding (trellis ≈ 47% of instructions; `trellis_quant.c` has zero `sf->`
+references) was right; my reading of it was not. Two speed features do gate
+per-block trellis — `perform_coeff_opt`/`coeff_opt_dist_threshold` and
+`perform_coeff_opt_based_on_satd`/`coeff_opt_satd_threshold`, both tuned per
+preset — and both are bypassed in `search_tx_type` when `tcq_enable()` is true.
+That is true for luma whenever TCQ is on (the CTC configuration), and the first
+call site passes `TX_CLASS_2D` as a literal so it holds for every transform
+class. Luma 2D is exempt at every preset.
+
+This is **not** a bug to reverse: under TCQ the decoder dequantises with the
+state machine, so quantising a luma block scalar-only and keeping its scalar
+`dqcoeff` would drift. The gates are off for a correctness reason. But it moves
+the target from "turn the missing gate on" to "stop trellising candidates that
+cannot win", which is `0027`.
+
+**Added `0026`** (the `0021` split method applied along transform block size)
+and **`0027`** (pre-trellis RD gate). `0027` is the larger prize: +7.7% locally,
+and its exposure is confined to dropping a candidate that would have won — it
+never alters the winner's coefficients, unlike `0025`.
+
+**Recorded as a method note:** for a size split, the number that decides the bet
+is not "how much BD must fall" but the *concentration* — whether the spared
+members carry more BD-rate share than time share. Stated as a BD cut,
+`0026`'s threshold 8 (−15%) looks easier than threshold 16 (−51%); stated as
+concentration, threshold 8 needs 1.9× and threshold 16 needs 1.1×. The second
+framing is the invariant one and reverses the choice of default.
+
+**Still not done, and now blocking judgement:** the cluster's EncTime
+repeatability has never been measured. Decisions this round turn on 0.1–1.7
+ratio points. One anchor-vs-anchor job — the same commit submitted twice as two
+arms — prices it permanently.

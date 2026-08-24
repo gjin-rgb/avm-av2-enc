@@ -1,0 +1,184 @@
+Patch 27: run the trellis only on transform-type candidates that can still win.
+
+Standalone, against anchor 5d628d8. Independent of patches 0025 and 0026 --
+they act on the dry pass, this one acts everywhere.
+
+THE FINDING BEHIND IT. A callgrind profile of this encoder puts trellis
+quantisation at ~47% of instructions retired, and av2/encoder/trellis_quant.c
+contains no speed-feature references at all. I previously described that as "no
+speed feature reaches it". That was wrong in an informative way: two speed
+features do govern per-block trellis, and both are switched off for the plane
+that carries the cost.
+
+In search_tx_type (av2/encoder/tx_search.c):
+
+    // ~line 2411
+    if (tcq_enable(cm->features.tcq_mode, is_lossless, plane, TX_CLASS_2D)) {
+      perform_block_coeff_opt = 1;                    // unconditionally ON
+    } else {
+      perform_block_coeff_opt =                       // sf: perform_coeff_opt
+          (block_mse_q8 <= coeff_opt_dist_threshold * qstep * qstep);
+    }
+    skip_trellis |= !perform_block_coeff_opt;
+
+    // ~line 2588
+    if (use_tcq) {
+      skip_trellis_based_on_satd[tx_type] = skip_trellis;
+    } else {
+      skip_trellis_based_on_satd[tx_type] =           // sf: ..._based_on_satd
+          skip_trellis_opt_based_on_satd(..., coeff_opt_satd_threshold, ...);
+    }
+
+tcq_enable() is true for luma when TCQ is on and the transform class is 2D --
+and note the first call site passes TX_CLASS_2D as a literal, so for luma it is
+true for every transform class. TCQ is on in the CTC configuration. So both
+per-block trellis gates -- `perform_coeff_opt` (tuned 0 -> 2/3 -> 3/5 -> 4/6
+across the presets) and `perform_coeff_opt_based_on_satd` (0 -> 1/2) -- are
+live only for chroma, for 1D transform classes, and for lossless. Luma 2D, the
+blocks that hold essentially all of the coefficient mass and all of the trellis
+time, is exempt at every preset.
+
+That is not an oversight to reverse. Under TCQ the decoder dequantises with the
+state machine, so an encoder that quantises a block scalar-only and keeps its
+scalar dqcoeff would drift. Forcing those gates back on for luma would be a
+correctness bug, not a speed feature. The gates are off for a reason.
+
+WHAT IS ACTUALLY WASTED. The waste is not that winners get trellised -- they
+must be. It is that losers get trellised too. av2_optimize_b (and through it
+av2_trellis_quant) is called inside the candidate loop, once per primary
+transform type, per secondary-transform index, per transform block. Up to 16
+primary types before pruning, times the IST/stx candidates. Exactly one of
+those results is kept; the rest are computed at full 8-state cost and thrown
+away.
+
+The code already knows this test is worth making. Immediately after the trellis
+it does:
+
+    // If rd cost based on coeff rate alone is already more than best_rd,
+    // terminate early.
+    if (RDCOST(x->rdmult, rate_cost, 0) > best_rd) continue;
+
+That check runs AFTER the trellis has been paid for, so it saves only the
+distortion call. This patch runs the same idea BEFORE it.
+
+WHAT THE PATCH DOES. After av2_quant has produced the FP-quantised
+coefficients, cost them with cost_coeffs, take dist_block_tx_domain, and drop
+the candidate before the trellis if that estimate is worse than the incumbent
+by more than a margin.
+
+The margin is not cosmetic. The estimate is pessimistic about the candidate:
+the trellis exists to lower rate, so the candidate's true post-trellis RD is
+below this figure, while best_rd is already post-trellis. Comparing them
+directly would prune candidates that would have won. The shift sets how much
+bias is forgiven -- the candidate is dropped only if it is worse than the
+incumbent by more than 1/2^SHIFT of its own cost:
+
+    -DAVM_TX_PRE_TRELLIS_GATE_SHIFT=2    drop only if 33% worse
+    -DAVM_TX_PRE_TRELLIS_GATE_SHIFT=3    drop only if 14% worse   (default)
+    -DAVM_TX_PRE_TRELLIS_GATE_SHIFT=4    drop only if  7% worse
+    -DAVM_TX_PRE_TRELLIS_GATE_SHIFT=5    drop only if  3% worse
+    -DAVM_TX_PRE_TRELLIS_GATE_SHIFT=-1   gate disabled (reproduces baseline)
+
+64-point transforms are excluded (three coefficient quadrants are forced to
+zero, so dist_block_tx_domain systematically mis-estimates them), as are FSC
+blocks and eob == 0.
+
+WHY THIS CANNOT CAUSE A MISMATCH. The gate only ever executes `continue` on a
+losing candidate. It never changes how the winning candidate is quantised,
+trellised, costed or reconstructed, and it modifies no state that survives the
+iteration -- it runs before av2_optimize_b touches dqcoeff, eobs and
+txb_entropy_ctx, so it perturbs strictly less than the existing continue two
+statements later. The quality cost is confined to one channel: a candidate that
+would have won may be dropped. Contrast patch 0025, which changed the
+coefficients that were actually kept.
+
+MEASURED LOCALLY (192x128, 4 frames, QP 185, cpu-used=3, three paired reps
+against the same baseline binary):
+
+    shift 2   -2.68%   (SLOWER: -3.44, -2.63, -1.98)
+    shift 3   +7.73%   (+7.43, +7.86, +7.91)
+    shift 4   +7.02%   (+6.93, +6.18, +7.97)
+
+The shift-2 result is the informative one. The gate is not free: cost_coeffs
+plus dist_block_tx_domain on every candidate costs about 2.7% of total encode
+time, and at a 33% margin the gate fires too rarely to repay it. Everything
+above shift 2 repays it several times over. Shifts 3 and 4 are within each
+other's spread here, so this clip does not separate them.
+
+All four variants produce distinct bitstreams and all decode cleanly with
+avmdec.
+
+WHAT TO RUN. Speed 3, two arms: shift 3 (default) and shift 4. Unlike 0025 this
+change is not confined to the dry pass, so it is not expected to collapse at
+Speed 4 the way 0025 did -- but Speed 3 is where the bar is closest and should
+be answered first.
+
+WHAT WOULD FALSIFY IT. The gate's whole premise is that a candidate whose
+untrellised RD is far above the incumbent would not have won after trellising.
+If BD-rate comes back above roughly 0.3% at shift 3, that premise is wrong --
+the trellis is reordering candidates, not just improving them, and the correct
+response is to raise the margin to shift 2 and accept that the gate cannot pay
+for its own overhead, i.e. to retire the patch rather than tune it.
+
+diff --git a/av2/encoder/tx_search.c b/av2/encoder/tx_search.c
+index 2af0748..77131e4 100644
+--- a/av2/encoder/tx_search.c
++++ b/av2/encoder/tx_search.c
+@@ -2626,6 +2626,57 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
+                                    tx_sf->prune_intra_ist_stx_by_zero_eob)) {
+           continue;
+         }
++        // Pre-trellis RD gate.
++        //
++        // The trellis (RDOQ, or the 8-state TCQ path) is the single most
++        // expensive step in this loop -- a callgrind profile of the encoder
++        // puts trellis quantisation at ~47% of instructions retired -- and it
++        // runs once per candidate transform type, per secondary-transform
++        // index, per transform block. Only one candidate survives.
++        //
++        // The FP-quantised coefficients for this candidate are already sitting
++        // in qcoeff after av2_quant above. Cost them, take the transform-domain
++        // distortion, and drop the candidate before the trellis runs if even
++        // that estimate cannot come near the incumbent.
++        //
++        // The estimate is PESSIMISTIC about the candidate: the trellis exists
++        // to lower rate, so the true post-trellis RD is below this one, while
++        // best_rd is already a post-trellis figure. Comparing the two directly
++        // would prune candidates that would have won. The shift is the margin
++        // that pays for that bias -- the candidate is dropped only when it is
++        // worse than the incumbent by more than 1/2^SHIFT of its own cost.
++        //
++        //     shift 2  ->  drop only if 33% worse   (safest, least speed)
++        //     shift 3  ->  drop only if 14% worse   (default)
++        //     shift 4  ->  drop only if  7% worse
++        //     shift -1 ->  gate disabled entirely
++        //
++        // Note this is the same test the existing line below already performs
++        // ("if rd cost based on coeff rate alone is already more than best_rd,
++        // terminate early") -- but that one runs AFTER the trellis has been
++        // paid for, so it saves only the distortion call. This one runs before.
++        //
++        // Excluded: 64-point transforms, where three quadrants of coefficients
++        // are forced to zero and dist_block_tx_domain systematically
++        // mis-estimates; FSC blocks, which take a different optimize path; and
++        // eob == 0, which the trellis would not be called on anyway.
++#ifndef AVM_TX_PRE_TRELLIS_GATE_SHIFT
++#define AVM_TX_PRE_TRELLIS_GATE_SHIFT 3
++#endif
++#if AVM_TX_PRE_TRELLIS_GATE_SHIFT >= 0
++        if (quant_param.use_optimize_b && !fsc_mode_in && *eob != 0 &&
++            best_rd != INT64_MAX && txw != 64 && txh != 64) {
++          const int pre_rate = cost_coeffs(cm, x, plane, block, tx_size,
++                                           packed_tx_type, CCTX_NONE, txb_ctx,
++                                           cm->features.reduced_tx_set_used);
++          int64_t pre_dist, pre_sse;
++          dist_block_tx_domain(x, plane, block, tx_size, &pre_dist, &pre_sse);
++          const int64_t pre_rd = RDCOST(x->rdmult, pre_rate, pre_dist);
++          if (pre_rd - (pre_rd >> AVM_TX_PRE_TRELLIS_GATE_SHIFT) > best_rd) {
++            continue;
++          }
++        }
++#endif  // AVM_TX_PRE_TRELLIS_GATE_SHIFT >= 0
+         if (fsc_mode_in && quant_param.use_optimize_b) {
+           av2_optimize_fsc(cpi, x, plane, block, tx_size, packed_tx_type,
+                            txb_ctx, &rate_cost);

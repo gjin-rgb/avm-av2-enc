@@ -1,0 +1,146 @@
+Patch 26: skip the dry-pass trellis only on transform blocks where it is
+expensive. Supersedes patch 0025 -- apply INSTEAD of it.
+
+Standalone, against anchor 5d628d8.
+
+WHAT 0025 MEASURED. Skipping the trellis in tx_type_rd for every dry-pass block
+gave, at Speed 3:
+
+    A1  +3.26% / +0.14% BD   ratio 23.3   (bar 25, miss by 1.7)
+    A2  +4.23% / +0.17% BD   ratio 24.9   (bar 25, miss by 0.1)
+
+and at Speed 4, A1 +1.23% / +0.26% (ratio 4.7) and A2 +3.86% / +0.20% (19.3).
+Speed 3 is the preset worth pursuing; Speed 4 should be abandoned for this
+change, where it buys little and costs more.
+
+The Speed-3 gap is the smallest this project has faced. A1 needs its BD-rate to
+fall 7% at constant speed. A2 needs 0.4%.
+
+WHY A SIZE SPLIT RATHER THAN A THRESHOLD. Patch 0021 established the method:
+when a bundled change fails on ratio, split it and keep the members that are
+cheap in quality. Disabling only the uneven 4-way partitions kept 39% of the
+family's speedup for 6% of its BD-rate cost -- ratio 207.7, where the whole
+family gave 30.6. Every threshold move on this project has slid along the
+trade-off instead; that split moved off it.
+
+The equivalent split here is transform block size. Trellis cost scales with the
+number of coefficients, so large blocks carry most of the time. Ranking damage
+does not scale the same way: on a small block each coefficient is a larger
+share of the block's rate, so replacing the trellis with the cheap quantiser
+shifts the RD estimate proportionally more. Large blocks are where skipping is
+expensive in time and cheap in quality -- the members worth keeping.
+
+So the trellis is skipped only when the transform block's short side is at
+least AVM_TX_DRY_TRELLIS_MIN_DIM; below that the dry pass keeps it.
+
+MEASURED LOCALLY (192x128, 4 frames, cpu-used=3, paired against the same
+baseline binary), speedup relative to unpatched:
+
+    0025, skip everywhere              +8.00%
+    threshold  8, keep 4x4 only        +7.26%   (91% of 0025's speedup)
+    threshold 16, keep 4x4 and 8x8     +4.19%   (52% of 0025's speedup)
+
+All three produce distinct bitstreams. Local runs cannot price BD-rate, so what
+the numbers establish is the speed side of the trade only.
+
+THE BET, STATED PLAINLY. This clears the bar only if BD-rate falls faster than
+speedup does. At threshold 16, A1 keeps ~1.70% speedup and needs its BD-rate
+down 51% to reach ratio 25. At threshold 8 it keeps ~2.97% and needs 15%. If
+BD-rate falls merely in proportion to speed at either setting, the ratio does
+not move and the patch is no better than 0025. That is exactly the bet 0021
+won and 06c lost, and I cannot tell from here which way it goes.
+
+Stated that way threshold 8 looks like the easier bet. It is not, and the
+correct comparison is worth spelling out. What the split needs is for the
+blocks it spares to be OVER-REPRESENTED in BD-rate relative to the time they
+carry. Writing f_s and f_b for the fractions of speedup and of BD-rate that
+survive the split, the ratio improves iff f_s / f_b >= 25 / 23.3 = 1.07:
+
+    threshold  8:  f_s = 0.91  ->  the 4xN blocks must carry >= 17% of the
+                   BD-rate while carrying 9% of the time    (1.9x concentration)
+    threshold 16:  f_s = 0.52  ->  the 4xN and 8xN blocks must carry >= 53% of
+                   the BD-rate while carrying 48% of the time (1.1x)
+
+Threshold 16 asks for far less concentration and is the better default. It is
+also favoured by a second effect: the 91%/52% splits above were measured on a
+192x128 clip, and 4K uses larger transform blocks, so at A1 resolutions the
+small-block share of trellis time should be lower than 48% and threshold 16
+should keep more speedup than it does here.
+
+The default is therefore 16. Running 8 and 16 as two arms brackets the curve
+and costs one extra rebuild rather than a patch edit:
+
+    -DAVM_TX_DRY_TRELLIS_MIN_DIM=8    keep trellis on 4x4 only
+    -DAVM_TX_DRY_TRELLIS_MIN_DIM=0    reproduces patch 0025 exactly
+    -DAVM_TX_DRY_TRELLIS_MIN_DIM=32   skip only on the largest blocks
+
+Run at Speed 3. If both arms land below 25, the honest conclusion is that
+dry-pass ranking genuinely needs trellised costs at every block size, and the
+47% has to be attacked in the wet pass instead.
+
+diff --git a/av2/encoder/tx_search.c b/av2/encoder/tx_search.c
+index 593fd92..31d8d84 100644
+--- a/av2/encoder/tx_search.c
++++ b/av2/encoder/tx_search.c
+@@ -3012,7 +3012,60 @@ static AVM_INLINE void tx_type_rd(const AV2_COMP *cpi, MACROBLOCK *x,
+   av2_subtract_txb(x, AVM_PLANE_Y, plane_bsize, blk_col, blk_row, tx_size,
+                    cpi->common.width, cpi->common.height, DCT_DCT);
+   RD_STATS this_rd_stats;
+-  const int skip_trellis = 0;
++  // Skip the trellis in the dry pass, but only on the transform blocks where
++  // it is expensive.
++  //
++  // BACKGROUND. A callgrind profile of this encoder puts trellis quantisation
++  // at ~47% of instructions retired, and av2/encoder/trellis_quant.c contains
++  // no speed-feature references at all. The two-pass dry pass declares that it
++  // avoids the trellis -- choose_tx_size_type_from_rd sets
++  // skip_trellis = x->apply_dry_pass_shortcuts ? 1 : 0 -- but this function,
++  // reached from try_tx_block_no_split once per transform block per transform
++  // partition candidate, had a hard-coded 0 and ran it at full strength.
++  //
++  // Patch 0025 skipped it here for every block and measured, at Speed 3:
++  //
++  //     A1  +3.26% / +0.14% BD   ratio 23.3   (bar 25)
++  //     A2  +4.23% / +0.17% BD   ratio 24.9   (bar 25)
++  //
++  // Both near-misses. A1 needs its BD-rate to fall only 7% at constant speed,
++  // and A2 needs 0.4%.
++  //
++  // WHY A SIZE SPLIT. Patch 0021 established the method: when a bundled change
++  // fails on ratio, split it and keep the members that are cheap in quality.
++  // Disabling only the uneven 4-way partitions kept 39% of the family's
++  // speedup for 6% of its BD-rate cost, giving ratio 207.7 where the whole
++  // family gave 30.6.
++  //
++  // The same split is available here, along transform block size. Trellis cost
++  // scales with the number of coefficients, so large transform blocks carry
++  // most of the time. But the ranking damage does not scale the same way: on a
++  // small block each coefficient is a larger share of the block's rate, so
++  // replacing the trellis with the cheap quantiser shifts the RD estimate
++  // proportionally more. Large blocks are therefore where skipping is cheap in
++  // quality and expensive in time -- exactly the members worth keeping.
++  //
++  // So the trellis is skipped only when the transform block's short side is at
++  // least AVM_TX_DRY_TRELLIS_MIN_DIM. Below that the dry pass keeps the
++  // trellis and its ranking fidelity.
++  //
++  //     -DAVM_TX_DRY_TRELLIS_MIN_DIM=0    reproduces patch 0025 exactly
++  //     -DAVM_TX_DRY_TRELLIS_MIN_DIM=8    skip on 8x8 and larger
++  //     -DAVM_TX_DRY_TRELLIS_MIN_DIM=32   skip only on the largest blocks
++  //
++  // Expected: less speedup than 0025, disproportionately less BD-rate. If the
++  // 16 threshold removes half the speedup and two thirds of the quality cost,
++  // A1 lands near 1.6% / 0.047% -- ratio 35. That is the shape of the bet, not
++  // a prediction of the numbers.
++#ifndef AVM_TX_DRY_TRELLIS_MIN_DIM
++#define AVM_TX_DRY_TRELLIS_MIN_DIM 16
++#endif
++  const int tx_short_side =
++      AVMMIN(tx_size_wide[tx_size], tx_size_high[tx_size]);
++  const int skip_trellis = (x->apply_dry_pass_shortcuts &&
++                            tx_short_side >= AVM_TX_DRY_TRELLIS_MIN_DIM)
++                               ? 1
++                               : 0;
+   int dummy = 0;
+   search_tx_type(cpi, x, 0, block, blk_row, blk_col, plane_bsize, tx_size,
+                  &dummy, txb_ctx, ftxs_mode, skip_trellis, ref_rdcost,
