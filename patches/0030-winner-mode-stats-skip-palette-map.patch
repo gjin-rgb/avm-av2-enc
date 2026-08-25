@@ -1,0 +1,160 @@
+Patch 30: stop zeroing 128 KB of palette map on every mode search.
+
+Bit-exact. Standalone, against anchor 44be072. Independent of 0027-0029.
+
+WHY THIS PATCH EXISTS AT ALL. The temporal-filter SSE2 result (+1.20% A1 /
++0.34% A2 at exactly 0.00% BD-rate) makes a point this project had been
+ignoring: a bit-exact speedup has an unbounded complexity-to-efficiency ratio
+and cannot fail the bar at any preset. Eleven rounds went to approximation
+patches that must clear 20-35. This is the first patch here in the other
+category.
+
+THE FINDING. A callgrind profile taken with screen-content tools disabled
+attributes 2.77% of retired instructions to libc memset reached through
+av2_rd_pick_intra_sby_mode. The source is one line:
+
+    av2/encoder/intra_mode_search.c:1759   av2_zero(x->winner_mode_stats);
+    av2/encoder/rdopt.c:9441               av2_zero(x->winner_mode_stats);
+
+and the sizes are:
+
+    WinnerModeStats           66,240 bytes
+      MB_MODE_INFO               632
+      RD_STATS                    40
+      color_index_map         65,536     <- MAX_SB_SQUARE, 256x256
+    array of 2, zeroed       132,480 bytes per call
+
+**98.9% of the 132 KB cleared on every mode search is the palette colour map.**
+A 4x4 luma block's intra mode search zeroes 128 KB of palette reconstruction
+state before it starts.
+
+WHY THE MAP DOES NOT NEED CLEARING. color_index_map is palette reconstruction
+state. The palette search writes a winner's map at the moment it records that
+winner, and nothing reads the map of a winner that was never recorded --
+x->winner_mode_count bounds the valid entries and is reset to zero on the line
+immediately after this call. The array is written before it is read.
+
+WHAT THE PATCH DOES. Adds av2_reset_winner_mode_stats() in block.h, which
+clears every field of WinnerModeStats except color_index_map, and calls it from
+both sites. The fields are cleared one at a time rather than as a byte span, so
+that adding a member to the struct produces a compile-time reminder rather than
+a silently uninitialised field.
+
+BIT-EXACTNESS, MEASURED. Six configurations, two clips, three QPs spanning the
+CTC ladder, two presets -- every one byte-identical to the unpatched encoder:
+
+    416x240 cpu-used=3 qp110   89ea7dc83488b29f == 89ea7dc83488b29f   BIT-EXACT
+    416x240 cpu-used=3 qp185   8eb66b3a763fce0b == 8eb66b3a763fce0b   BIT-EXACT
+    416x240 cpu-used=3 qp235   fb12fe15646b5730 == fb12fe15646b5730   BIT-EXACT
+    192x128 cpu-used=4 qp110   5f1d203279c2905b == 5f1d203279c2905b   BIT-EXACT
+    192x128 cpu-used=4 qp185   520ccf425745a016 == 520ccf425745a016   BIT-EXACT
+    192x128 cpu-used=4 qp235   1e6fe90eef667bd6 == 1e6fe90eef667bd6   BIT-EXACT
+
+This is evidence, not proof: it shows the map is written before it is read on
+these paths, not on all paths. A CTC run reporting 0.00% BD-rate on every
+metric -- which is what the temporal-filter patch got -- would settle it, and
+that is the check to insist on.
+
+THE SPEEDUP IS NOT YET MEASURED, AND I AM NOT GOING TO GUESS IT. Wall-clock
+paired timing on this machine gave +1.09% (sd 3.89, n=3) and -0.79% (sd 4.30,
+n=2) on two configurations -- a noise floor around 4%, far above anything this
+change could produce. By this project's own rule, that is not a small speedup,
+it is no measurement at all. Deterministic instruction counts are running; the
+figure will follow. Do not quote a wall-clock number for this patch.
+
+What can be said without measuring: the change removes 131,072 bytes of memory
+traffic per call at two call sites, both of which fire once per mode search per
+block. The upper bound on the gain is the profile line it targets.
+
+WHAT TO RUN. One arm at any preset -- the change is preset-independent, and the
+question it answers ("is it still 0.00% BD-rate at CTC scale?") is the same at
+every preset. Speed 4 is the cheapest place to ask it.
+
+RELATED WORK NOT IN THIS PATCH. The same profile shows a second large memset,
+3.18% of instructions, inside av2_build_inter_predictors:
+
+    if (plane == AVM_PLANE_Y)
+      memset(xd->mv_refined, 0, 2 * N_OF_OFFSETS * sizeof(int_mv));
+
+With OF_BSIZE_LOG2 == 3 and MAX_SB_SIZE_LOG2 == 8 that is 8,192 bytes cleared
+on every luma inter-predictor build, for a block that may need two entries.
+av2_get_optflow_based_mv() indexes mv_refined densely from zero over
+n_blocks = (bw/n)*(bh/n) sub-blocks, so a bounded clear looks correct -- but n
+can be 4 rather than OF_BSIZE when use_4x4 is set, and I have not established
+the resulting worst-case bound. That check has to be done before the change is
+safe, so it is written down here rather than shipped half-verified.
+
+diff --git a/av2/encoder/block.h b/av2/encoder/block.h
+index 2c76bf7..a3c5ff2 100644
+--- a/av2/encoder/block.h
++++ b/av2/encoder/block.h
+@@ -1776,6 +1776,43 @@ static AVM_INLINE bool is_bsize_gt(BLOCK_SIZE bsize1, BLOCK_SIZE bsize2) {
+          block_size_high[bsize1] > block_size_high[bsize2];
+ }
+ 
++/*!\brief Reset the winner-mode bookkeeping without clearing the palette map.
++ *
++ * `av2_zero(x->winner_mode_stats)` clears 132,480 bytes, of which 131,072
++ * (98.9%) is the two `color_index_map[MAX_SB_SQUARE]` arrays. Those arrays are
++ * palette reconstruction state: the palette search writes a winner's map when
++ * it records that winner, and nothing reads a map for a winner that was never
++ * recorded (`x->winner_mode_count` bounds the valid entries, and it is reset to
++ * zero alongside this call).
++ *
++ * Zeroing them therefore costs 128 KB of memory traffic per mode search, at
++ * both call sites, to initialise storage that is written before it is read. A
++ * callgrind profile with screen-content tools disabled attributes 2.77% of
++ * retired instructions to libc memset reached through
++ * `av2_rd_pick_intra_sby_mode` alone; the inter call site fires far more often
++ * in a random-access encode.
++ *
++ * Every other field is still cleared, field by field rather than by a span, so
++ * that adding a member to WinnerModeStats produces a compile-time reminder
++ * rather than a silently uninitialised field.
++ */
++static INLINE void av2_reset_winner_mode_stats(MACROBLOCK *x) {
++  const int n =
++      (int)(sizeof(x->winner_mode_stats) / sizeof(x->winner_mode_stats[0]));
++  for (int i = 0; i < n; ++i) {
++    WinnerModeStats *const ws = &x->winner_mode_stats[i];
++    av2_zero(ws->mbmi);
++    av2_zero(ws->rd_cost);
++    ws->rd = 0;
++    ws->rate_y = 0;
++    ws->rate_uv = 0;
++    ws->mode = 0;
++    ws->refs[0] = 0;
++    ws->refs[1] = 0;
++    // ws->color_index_map is deliberately NOT cleared -- see above.
++  }
++}
++
+ static INLINE void set_blk_skip(uint8_t txb_skip[], int blk_idx, int skip) {
+   if (skip)
+     txb_skip[blk_idx] |= 1UL;
+diff --git a/av2/encoder/intra_mode_search.c b/av2/encoder/intra_mode_search.c
+index 84a9383..8f2c591 100644
+--- a/av2/encoder/intra_mode_search.c
++++ b/av2/encoder/intra_mode_search.c
+@@ -1756,7 +1756,7 @@ int64_t av2_rd_pick_intra_sby_mode(const AV2_COMP *const cpi, ThreadData *td,
+   mbmi->mapped_intra_mode[PLANE_TYPE_Y][mbmi->txb_idx] = DC_PRED;
+ 
+   MB_MODE_INFO best_mbmi = *mbmi;
+-  av2_zero(x->winner_mode_stats);
++  av2_reset_winner_mode_stats(x);
+   x->winner_mode_count = 0;
+   mbmi->dpcm_mode_y = 0;
+ 
+diff --git a/av2/encoder/rdopt.c b/av2/encoder/rdopt.c
+index b015b70..1b6c19e 100644
+--- a/av2/encoder/rdopt.c
++++ b/av2/encoder/rdopt.c
+@@ -9438,7 +9438,7 @@ void av2_rd_pick_inter_mode_sb(struct AV2_COMP *cpi,
+   }
+ 
+   // Initialize best mode stats for winner mode processing
+-  av2_zero(x->winner_mode_stats);
++  av2_reset_winner_mode_stats(x);
+   x->winner_mode_count = 0;
+   const MV_REFERENCE_FRAME init_refs[2] = { -1, -1 };
+   store_winner_mode_stats(&cpi->common, x, mbmi, NULL, NULL, NULL, init_refs,

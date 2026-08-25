@@ -1,0 +1,183 @@
+Patch 28: give the pre-trellis gate a margin finer than a power of two.
+
+Supersedes patch 0027 -- apply INSTEAD of it. Standalone, against anchor
+44be072 ("Add early termination in warp delta refinement", #5309).
+
+WHAT 0027 MEASURED. At Speed 3, with the margin at shift 3 (1/8 of the
+candidate's own cost):
+
+    A1  +3.79% / +0.09% BD   ratio 42.1    bar 25, passes by 1.7x
+    A2  +3.03% / +0.15% BD   ratio 20.2    bar 25, misses by 4.8
+
+and at shift 4 (1/16), both classes got faster and worse:
+
+    A1  +4.71% / +0.17% BD   ratio 27.7
+    A2  +5.40% / +0.37% BD   ratio 14.6
+
+A1 passed in every arm run, including both Speed 4 arms (28.5 and 44.7). A2
+binds everywhere. Speed 4 should be dropped for this family: its best A2 result
+was 9.2, and its absolute speedups were ~1-2%.
+
+WHICH DIRECTION TO MOVE. The marginal ratio of the shift 3 -> shift 4 step is
+
+    A1:  (4.71-3.79) / (0.17-0.09) = 11.5
+    A2:  (5.40-3.03) / (0.37-0.15) = 10.8
+
+Both are far below the ratio each class is already operating at (42.1 and 20.2).
+A change only improves a ratio if its marginal ratio is above that ratio, so
+tightening the margin moves the whole family the wrong way -- which is exactly
+what the shift 4 arms showed. **The correct direction is to loosen it.**
+
+HOW FAR. Solving for the point where A2 reaches the bar, at A2's own observed
+marginal ratio of 10.8:
+
+    give up 0.55 of A2's 3.03% speedup  ->  (+2.48%, +0.099%)  =  ratio 25.0
+    the same proportional give-up on A1 ->  (+3.11%, +0.031%)  =  ratio ~100
+
+That is an 18% reduction in speedup. **The problem is that the next power-of-two
+step is nothing like 18%.** Measured locally (192x128, 4 frames, QP 185,
+cpu-used=3, three paired reps against the same baseline binary), speedup
+retained relative to the shift-3 setting:
+
+    MARGIN64  8  (= shift 3)   +17.68%   100%
+    MARGIN64 10                +14.60%    83%     <- the 18% give-up, near exactly
+    MARGIN64 12                +13.39%    76%
+    MARGIN64 16  (= shift 2)    +8.44%    48%     <- far too coarse
+
+Going to shift 2 gives up 52% of the speedup to buy a quality improvement that
+only needed 18% of it.
+
+WHAT THE PATCH DOES. Nothing but reparameterize the margin from a shift to a
+fraction in 64ths, so settings between the two powers of two CTC has already
+bracketed become reachable:
+
+    -DAVM_TX_PRE_TRELLIS_GATE_MARGIN64=4    drop if  6.7% worse  (= old shift 4)
+    -DAVM_TX_PRE_TRELLIS_GATE_MARGIN64=8    drop if 14.3% worse  (= old shift 3)
+    -DAVM_TX_PRE_TRELLIS_GATE_MARGIN64=10   drop if 18.5% worse  (NEW)
+    -DAVM_TX_PRE_TRELLIS_GATE_MARGIN64=12   drop if 23.1% worse  (NEW, default)
+    -DAVM_TX_PRE_TRELLIS_GATE_MARGIN64=16   drop if 33.3% worse  (= old shift 2)
+    -DAVM_TX_PRE_TRELLIS_GATE_MARGIN64=0    gate disabled
+
+THE REPARAMETERIZATION IS EXACT, AND THAT IS CHECKED, NOT ASSERTED. Built at
+MARGIN64=8 and run against the 0027 shift-3 binary on the same clip, the two
+produce byte-identical bitstreams:
+
+    0027 shift 3     md5 bd66192aa502bbec   476 bytes
+    0028 MARGIN64=8  md5 bd66192aa502bbec   476 bytes
+
+so K=10 and K=12 sit on the same curve as the CTC points already measured, and
+the arms below are directly comparable to the 0027 numbers above.
+
+WHAT TO RUN. Speed 3 only, two arms: MARGIN64=12 (default) and MARGIN64=10.
+Nothing at Speed 4.
+
+WHAT I EXPECT, AND WHY IT IS A RANGE NOT A NUMBER. If the 83% / 76% speedup
+retention transfers from the local clip and BD-rate falls at the observed
+marginal ratio, A2 lands near 24.6 at K=10 and near 28.0 at K=12. Those
+figures come from a two-point linear fit extrapolated backwards, and BD-rate
+cannot keep falling linearly as it approaches zero -- the model certainly
+over-predicts at the low end, which is why K=12 rather than K=10 is the
+default. **The honest prediction is that A2 lands somewhere in 24-30 at K=12,
+and A1 comfortably above the bar in both arms.**
+
+WHAT WOULD FALSIFY IT. If A2 at K=12 comes back below 25 while its speedup is
+down by the expected quarter, then BD-rate is not falling with the prune count
+-- the damage is coming from a small number of prunes that survive at every
+margin, and no setting of this knob will fix it. In that case the gate needs
+the bias removed rather than padded, which is patch 0029.
+
+diff --git a/av2/encoder/tx_search.c b/av2/encoder/tx_search.c
+index be3b148..6665826 100644
+--- a/av2/encoder/tx_search.c
++++ b/av2/encoder/tx_search.c
+@@ -2626,6 +2626,90 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
+                                    tx_sf->prune_intra_ist_stx_by_zero_eob)) {
+           continue;
+         }
++        // Pre-trellis RD gate.
++        //
++        // The trellis (RDOQ, or the 8-state TCQ path) is the single most
++        // expensive step in this loop -- a callgrind profile of the encoder
++        // puts trellis quantisation at ~47% of instructions retired -- and it
++        // runs once per candidate transform type, per secondary-transform
++        // index, per transform block. Only one candidate survives.
++        //
++        // The FP-quantised coefficients for this candidate are already sitting
++        // in qcoeff after av2_quant above. Cost them, take the transform-domain
++        // distortion, and drop the candidate before the trellis runs if even
++        // that estimate cannot come near the incumbent.
++        //
++        // The estimate is PESSIMISTIC about the candidate: the trellis exists
++        // to lower rate, so the true post-trellis RD is below this one, while
++        // best_rd is already a post-trellis figure. Comparing the two directly
++        // would prune candidates that would have won. The margin pays for that
++        // bias -- the candidate is dropped only when it is worse than the
++        // incumbent by more than MARGIN64/64 of its own cost.
++        //
++        // The margin was a power-of-two shift in the first version of this
++        // gate. CTC showed that to be too coarse a control. At shift 3 (a
++        // 1/8 margin, MARGIN64 == 8):
++        //
++        //     A1  +3.79% / +0.09% BD  ratio 42.1   (bar 25, passes by 1.7x)
++        //     A2  +3.03% / +0.15% BD  ratio 20.2   (bar 25, misses by 4.8)
++        //
++        // and at shift 4 (a 1/16 margin, MARGIN64 == 4) both classes got
++        // faster and worse: A1 27.7, A2 14.6. The marginal ratio of that step
++        // is 11.5 on A1 and 10.8 on A2 -- far below the ratio each class is
++        // already operating at -- so the whole family moves the wrong way when
++        // the margin is tightened, and the correct direction is to LOOSEN it.
++        //
++        // How much? At A2's observed marginal ratio of 10.8, giving up 0.55
++        // percentage points of its 3.03% speedup lands it at
++        // (+2.48%, +0.099%) = ratio 25.0 exactly, and takes A1 to roughly
++        // (+3.11%, +0.031%) = ratio 101. That is an 18% reduction in speedup.
++        // The next power-of-two step, shift 2, doubles the margin and (on a
++        // local paired measurement) makes the gate fire so rarely that it no
++        // longer repays its own cost -- far more than an 18% give-up.
++        //
++        // So the margin is now in 64ths, and the interesting settings are
++        // between the two powers of two that CTC has already bracketed:
++        //
++        //     MARGIN64  4   drop if  6.7% worse   (= old shift 4, measured)
++        //     MARGIN64  8   drop if 14.3% worse   (= old shift 3, measured)
++        //     MARGIN64 10   drop if 18.5% worse   (NEW)
++        //     MARGIN64 12   drop if 23.1% worse   (NEW, default)
++        //     MARGIN64 16   drop if 33.3% worse   (= old shift 2)
++        //     MARGIN64  0   gate disabled entirely
++        //
++        // ("drop if X worse" is the threshold on pre_rd/best_rd, i.e.
++        //  64/(64-MARGIN64) - 1.)
++        //
++        // Note this is the same test the existing line below already performs
++        // ("if rd cost based on coeff rate alone is already more than best_rd,
++        // terminate early") -- but that one runs AFTER the trellis has been
++        // paid for, so it saves only the distortion call. This one runs before.
++        //
++        // Excluded: 64-point transforms, where three quadrants of coefficients
++        // are forced to zero and dist_block_tx_domain systematically
++        // mis-estimates; FSC blocks, which take a different optimize path; and
++        // eob == 0, which the trellis would not be called on anyway.
++#ifndef AVM_TX_PRE_TRELLIS_GATE_MARGIN64
++#define AVM_TX_PRE_TRELLIS_GATE_MARGIN64 12
++#endif
++#if AVM_TX_PRE_TRELLIS_GATE_MARGIN64 > 0
++        if (quant_param.use_optimize_b && !fsc_mode_in && *eob != 0 &&
++            best_rd != INT64_MAX && txw != 64 && txh != 64) {
++          const int pre_rate = cost_coeffs(cm, x, plane, block, tx_size,
++                                           packed_tx_type, CCTX_NONE, txb_ctx,
++                                           cm->features.reduced_tx_set_used);
++          int64_t pre_dist, pre_sse;
++          dist_block_tx_domain(x, plane, block, tx_size, &pre_dist, &pre_sse);
++          const int64_t pre_rd = RDCOST(x->rdmult, pre_rate, pre_dist);
++          // pre_rd is bounded well below INT64_MAX/64 here (it is an RD cost
++          // for a single transform block), so the multiply cannot overflow.
++          const int64_t pre_rd_discounted =
++              pre_rd - ((pre_rd * AVM_TX_PRE_TRELLIS_GATE_MARGIN64) >> 6);
++          if (pre_rd_discounted > best_rd) {
++            continue;
++          }
++        }
++#endif  // AVM_TX_PRE_TRELLIS_GATE_MARGIN64 > 0
+         if (fsc_mode_in && quant_param.use_optimize_b) {
+           av2_optimize_fsc(cpi, x, plane, block, tx_size, packed_tx_type,
+                            txb_ctx, &rate_cost);

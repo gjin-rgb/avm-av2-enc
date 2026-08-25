@@ -552,3 +552,77 @@ framing is the invariant one and reverses the choice of default.
 repeatability has never been measured. Decisions this round turn on 0.1–1.7
 ratio points. One anchor-vs-anchor job — the same commit submitted twice as two
 arms — prices it permanently.
+
+---
+
+## 2026-08-25 — `0026` retired with a lesson; `0027` is the second-best result; the first bit-exact patch
+
+**`0027` results.** Speed 3: A1 +3.79%/+0.09% → 42.1 (PASS), A2 +3.03%/+0.15% →
+20.2. A1 passed in **all four** arms run (27.7–44.7). A2 binds everywhere. Only
+`0021` has done better on this project.
+
+**Direction settled by marginal ratio.** shift 3 → shift 4 has marginal ratio
+11.5 (A1) and 10.8 (A2), far below each class's operating ratio, so tightening
+drags the family down — which is what the shift-4 arms showed. The family must
+loosen. A2 needs to give up 18% of its speedup to reach 25; the next
+power-of-two step gives up 52%. Hence `0028`, a margin in 64ths, with K=8 proven
+byte-identical to shift 3 so the new points sit on the measured curve.
+
+**Killed: Speed 4 for the gate family.** A2 ratios 9.2 and 7.9, absolute
+speedups 1–2%.
+
+**`0026` retired, and the reason is worth more than the patch.** The speed model
+was right (36/48% retention against 52% predicted); the quality model was
+backwards. Skipping *fewer* blocks made BD-rate *worse* (+86% A1, +35% A2),
+which is impossible under additive damage. Mechanism: the dry pass **compares**
+transform partitionings, and at threshold 16 a 16x16 candidate is untrellised
+while its four 8x8 children are trellised, biasing every such comparison toward
+the split; finer TX partitioning costs rate.
+
+> **An approximation applied uniformly across a comparison set preserves
+> ordering; applied to only part of the set, it corrupts ordering. Never make
+> cost-model fidelity depend on a property that varies within a single RD
+> comparison.**
+
+This also resolves why `0021` worked where `0026` failed, having looked like the
+same move: `0021` **removed** candidates (survivors evaluated identically);
+`0026` **kept** them at different fidelities. And it is why `0027`–`0029` are
+structurally safe — they drop candidates, they never mis-cost them.
+
+**New category opened: bit-exact patches.** The temporal-filter SSE2 result
+(+1.20%/+0.34% at exactly 0.00% BD) makes the point that a bit-exact speedup has
+an unbounded complexity-to-efficiency ratio and cannot fail the bar. Eleven
+rounds went to approximation patches that must clear 20–35. That allocation was
+wrong.
+
+**Audit performed.** Cross-referenced every direct `_c` call against both RTCD
+`specialize` lists, and a clean callgrind profile against the same lists:
+
+- **The trellis is fully AVX2-covered and correctly dispatched.** All twelve TCQ
+  kernels have AVX2 implementations, all built, all reached — the profile shows
+  them by name. This closes the open question from the architecture study: the
+  ~47% is real vector work, so **the only lever on it is algorithmic**, which is
+  what `0027` is.
+- **Temporal filtering has a second unvectorised path.** `MULTITAP_SHARP2` (12
+  taps) is used only by `tf_build_predictor`, and `highbd_convolve_2d_facade_single`
+  routes >8-tap filters to the C convolve. Specified in the round report; not
+  shipped, because a SIMD kernel needs its unit tests.
+- `av2_get_nz_map_contexts_skip` has no SIMD while its sibling has sse2.
+
+**`0030`** (bit-exact): `av2_zero(x->winner_mode_stats)` clears 132,480 bytes of
+which 131,072 (98.9%) is `color_index_map[MAX_SB_SQUARE]`, at both mode-search
+call sites. Profile attributes 2.77% to memset via `av2_rd_pick_intra_sby_mode`
+alone. Bit-exact on six configurations. **Speedup deliberately not quoted** —
+wall-clock noise floor was ~4%, which by this project's own rule is no
+measurement; instruction counts pending.
+
+**Correction to my own profile.** `PROFILE_5d628d8_cpu4.txt` was taken on a
+`gen_clip.py` synthetic clip that appears to trip the screen-content detector.
+Its `av2_is_dv_valid` (1.84%) and `av2_optimize_fsc_block` (2.51%) lines are
+artefacts and were used to motivate nothing. Re-profiled with screen tools off;
+both vanish, and the memset lines appear with caller attribution. The trellis
+lines are unaffected.
+
+**Third request, unanswered:** the cluster's EncTime repeatability has never
+been measured. This round turns on 4.8 ratio points on A2. One anchor-vs-anchor
+job prices it permanently.
