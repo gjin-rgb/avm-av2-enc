@@ -55,16 +55,27 @@ these paths, not on all paths. A CTC run reporting 0.00% BD-rate on every
 metric -- which is what the temporal-filter patch got -- would settle it, and
 that is the check to insist on.
 
-THE SPEEDUP IS NOT YET MEASURED, AND I AM NOT GOING TO GUESS IT. Wall-clock
-paired timing on this machine gave +1.09% (sd 3.89, n=3) and -0.79% (sd 4.30,
-n=2) on two configurations -- a noise floor around 4%, far above anything this
-change could produce. By this project's own rule, that is not a small speedup,
-it is no measurement at all. Deterministic instruction counts are running; the
-figure will follow. Do not quote a wall-clock number for this patch.
+THE SPEEDUP, MEASURED THE ONLY WAY THAT WORKED. Wall-clock paired timing on
+this machine gave +1.09% (sd 3.89, n=3) and -0.79% (sd 4.30, n=2) -- a noise
+floor near 4%, far above anything this change produces. By this project's own
+rule that is not a small speedup, it is no measurement at all.
 
-What can be said without measuring: the change removes 131,072 bytes of memory
-traffic per call at two call sites, both of which fire once per mode search per
-block. The upper bound on the gain is the profile line it targets.
+Retired-instruction counts under callgrind are deterministic to well under 0.1%
+and settle it (192x128, 3 frames, QP 185, cpu-used=4):
+
+    baseline    91,999,025,540 Ir
+    patch 30    90,002,728,820 Ir
+    reduction    1,996,296,720 Ir  =  2.170%
+
+**2.17% of retired instructions, at zero quality cost.** That is consistent with
+the profile line it targets (2.77% attributed to memset reached through
+av2_rd_pick_intra_sby_mode alone, on a clip where intra was over-represented).
+
+One caveat on reading this number: the work removed is memory traffic, and
+instruction counts are an imperfect proxy for its wall-clock cost. A vectorised
+memset retires few instructions per byte written, so if anything Ir understates
+what 128 KB of avoided stores and the cache pressure they cause are worth. The
+2.17% should be treated as a floor rather than an estimate.
 
 WHAT TO RUN. One arm at any preset -- the change is preset-independent, and the
 question it answers ("is it still 0.00% BD-rate at CTC scale?") is the same at

@@ -356,14 +356,34 @@ shows the map is written before read on these paths, not on all paths. The CTC
 run reporting 0.00% on every metric is the check to insist on, exactly as the
 temporal-filter patch got.
 
-### I am not quoting a speedup for it
+### The speedup, measured the only way that worked
 
 Paired wall-clock gave +1.09% (sd 3.89, n=3) and −0.79% (sd 4.30, n=2) — a noise
 floor near 4%, far above anything this change produces. By this project's own
 rule that is **not a small speedup, it is no measurement at all**, and the rule
-exists because round 1 reported six of them. Deterministic instruction counts
-are running under callgrind; the number will follow. `perf` is not available on
-this machine, which is why callgrind rather than `perf stat -e instructions`.
+exists because round 1 reported six of them.
+
+Retired-instruction counts under callgrind are deterministic to well under 0.1%
+and settle it (192x128, 3 frames, QP 185, cpu-used=4):
+
+```
+baseline    91,999,025,540 Ir
+patch 0030  90,002,728,820 Ir
+reduction    1,996,296,720 Ir  =  2.170%
+```
+
+**2.17% of retired instructions at zero quality cost.** Consistent with the
+2.77% the profile attributed to memset through `av2_rd_pick_intra_sby_mode`
+alone, on a clip where intra was over-represented.
+
+One caveat on reading it: the work removed is *memory traffic*, and a vectorised
+memset retires few instructions per byte written. Ir therefore probably
+understates what 128 KB of avoided stores — and the cache pressure they cause —
+are worth in wall time. **Treat 2.17% as a floor, not an estimate.**
+
+(`perf` is not installed on this machine, which is why callgrind rather than
+`perf stat -e instructions`. Tier 1 of the protocol should note that callgrind
+Ir is an acceptable substitute.)
 
 ### A second memset, specified but not shipped
 

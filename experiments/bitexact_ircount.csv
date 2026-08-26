@@ -1,0 +1,5 @@
+# Tier 1 measurement for patch 0030, callgrind retired-instruction counts.
+# 192x128, 3 frames, QP 185, cpu-used=4, single-threaded. Deterministic.
+tag,instructions
+base,91999025540
+p0030,90002728820

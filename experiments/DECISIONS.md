@@ -612,9 +612,15 @@ wrong.
 **`0030`** (bit-exact): `av2_zero(x->winner_mode_stats)` clears 132,480 bytes of
 which 131,072 (98.9%) is `color_index_map[MAX_SB_SQUARE]`, at both mode-search
 call sites. Profile attributes 2.77% to memset via `av2_rd_pick_intra_sby_mode`
-alone. Bit-exact on six configurations. **Speedup deliberately not quoted** —
-wall-clock noise floor was ~4%, which by this project's own rule is no
-measurement; instruction counts pending.
+alone. Bit-exact on six configurations. Wall-clock was useless (noise floor ~4%);
+**callgrind retired-instruction counts give 2.170%** (91,999,025,540 →
+90,002,728,820), deterministic to well under 0.1%. Since the removed work is
+memory traffic and a vectorised memset retires few instructions per byte, Ir
+probably understates the wall-time gain — treat 2.17% as a floor.
+
+**Protocol note:** `perf` is not available on this machine. Callgrind Ir counts
+serve the same purpose for Tier 1 and should be recorded as an accepted
+substitute in `README.md`.
 
 **Correction to my own profile.** `PROFILE_5d628d8_cpu4.txt` was taken on a
 `gen_clip.py` synthetic clip that appears to trip the screen-content detector.
