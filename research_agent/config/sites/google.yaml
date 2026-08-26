@@ -1,0 +1,61 @@
+# A Google workstation (Cloudtop). The three sanctioned internal touchpoints --
+# data storage, code storage, and CTC runs -- are configured here and nowhere
+# else. Removing this file leaves a working system.
+#
+# Fill in the paths marked REQUIRED before first use; av2ra doctor will tell you
+# which are missing rather than failing four hours into a screening pass.
+
+project:
+  avm_repo: "~/av2/avm"
+
+git:
+  upstream: ""            # optional personal fork, e.g. https://github.com/<user>/avm.git
+
+infra:
+  blobs: "cns"
+  cns_prefix: "/cns/REQUIRED/av2ra"          # REQUIRED: artifact + lease storage
+  cns_local_cache: "~/.cache/av2ra/cns"
+  code: "git"                                 # or "citc" to stage into a client
+  git_repo: "~/work/av2/agent/prior_research/avm-patches"
+  git_remote: "origin"
+  git_branch: "main"
+  git_push: false                             # set true once you trust the output
+  citc_client: "~/citc/av2_research_agent"
+  citc_package: "google3/experimental/users/REQUIRED/av2_research_agent"
+  notifier: "sendgmr"
+  notify_recipient: "REQUIRED@google.com"
+  health: "google"
+  loas_warn_hours: 4.0
+  min_free_gib: 20.0
+
+ctc:
+  backend: "eda"
+  kickoff_script: "/google/src/head/depot/google3/experimental/users/REQUIRED/eda/kick_off_av2ctc_eda.sh"
+  compare_script: "/google/src/head/depot/google3/experimental/users/REQUIRED/aom_tools/compare_eda_runs.py"
+  project: "blade"
+  timing_accuracy: "high"
+  chunk_size: 65
+  crosscheck: 0
+  extra_cmake_args: "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+  testsets: ["a1", "a2"]
+  configs: ["ra"]
+  anchor_reuse: true
+  # Frame counts are per class (A1 runs 17 frames, A2 runs 33) and are derived in
+  # av2ra.ctc.contract. A single --frame_count for both, as the draft protocol
+  # specified, doubles the cost of the 4K half of every round.
+
+clips:
+  local_cache: "~/clips/av2_a2"
+  cns_source: "/cns/REQUIRED/av2ctc/a2_2k"
+
+knowledge:
+  prior_research: "~/work/av2/agent/prior_research/avm-patches"
+
+measure:
+  workers: 6            # 16 vCPU Cloudtop: 6 x 2 threads leaves room for builds
+  cpus_per_worker: 2
+  acceptance_mode: "conservative"
+
+planner:
+  ctc_slots_per_day: 4.0
+  ctc_min_arms: 2

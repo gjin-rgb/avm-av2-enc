@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run av2ra from a checkout without installing it.
+#
+#   tools/av2ra --site=sim --workspace=/tmp/av2ra demo
+#
+# Installing (`pip install -e .`) gives the same thing on PATH as `av2ra`.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}"
+exec "${PYTHON:-python3}" -m av2ra.cli "$@"

@@ -1,0 +1,157 @@
+# av2ra defaults. Everything here is infrastructure-agnostic; anything that
+# names a cluster, a filesystem prefix or a credential lives in config/sites/.
+#
+# Resolution order (last wins): this file, config/sites/<site>.yaml,
+# $AV2RA_WORKSPACE/config.yaml, AV2RA_* environment variables, --set flags.
+
+project:
+  workspace: "~/av2ra-workspace"
+  avm_repo: "~/av2/avm"
+  node_id: "local"
+  verbose: false
+
+git:
+  origin: "https://github.com/AOMediaCodec/avm.git"
+  upstream: ""
+  anchor_branch: "av2-enc"
+  anchor_remote: "origin/av2-enc"
+
+# Which infrastructure backs the three sanctioned touchpoints. Everything else
+# in the system is unaffected by these values.
+infra:
+  blobs: "local"          # local | cns
+  code: "none"            # none | git | citc
+  notifier: "file"        # file | sendgmr
+  health: "local"         # local | google
+  min_free_gib: 15.0
+  blob_root: ""           # defaults to <workspace>/blobs
+
+ctc:
+  backend: "sim"          # sim | local | eda
+  testsets: ["a1", "a2"]
+  configs: ["ra"]
+  anchor_reuse: true
+  sim_latency_s: 0.0
+
+measure:
+  preset: 2
+  reps: 2
+  workers: 2
+  cpus_per_worker: 2
+  run_holdout: true
+  null_arm_every: 10      # ticks between anchor-vs-anchor harness checks
+  conformance_sample: 4   # 0 decodes every candidate bitstream
+  acceptance_mode: "conservative"   # point | conservative
+  encoder: ""             # set by the loop from the anchor build
+  decoder: ""
+
+build:
+  jobs: 0                 # 0 -> all available CPUs
+  cache_keep: 8
+
+planner:
+  max_open: 6
+  max_subsystem_fraction: 0.4
+  max_tuning_depth: 3
+  ctc_slots_per_day: 4.0
+  ctc_min_arms: 2
+  require_holdout: true
+
+policy:
+  max_changed_files: 12
+  max_changed_lines: 1500
+
+agent:
+  llm: "auto"             # auto | anthropic | offline
+  model: "claude-opus-5"
+  max_implementation_attempts: 3
+
+knowledge:
+  prior_research: ""      # checkout of the shared results repository
+  import_profile: ""      # a callgrind_annotate or perf report to seed targeting
+
+# Clip sets. `screen` is what the agent optimises against and may overfit;
+# `holdout` is never shown to ideation and never used to pick a threshold, so a
+# gap between the two is a measurement of overfitting rather than of the patch.
+clips:
+  local_cache: "~/clips/av2"
+  screen:
+    name: "a2-screen"
+    config: "RA"
+    frames: 17
+    qps: [160, 185, 210]
+    sequences:
+      - id: "A2_RitualDance"
+        filename: "RitualDance_1920x1080_5994_10bit_420.y4m"
+        width: 1920
+        height: 1080
+        fps_num: 60000
+        fps_denom: 1001
+        bit_depth: 10
+        class: "A2"
+      - id: "A2_Boat"
+        filename: "Boat_1920x1080_5994_10bit_420.y4m"
+        width: 1920
+        height: 1080
+        fps_num: 60000
+        fps_denom: 1001
+        bit_depth: 10
+        class: "A2"
+      - id: "A2_DinnerScene"
+        filename: "DinnerSceneCropped_1920x1080_2997fps_10bit_420.y4m"
+        width: 1920
+        height: 1080
+        fps_num: 30000
+        fps_denom: 1001
+        bit_depth: 10
+        class: "A2"
+      - id: "A2_OldTownCross"
+        filename: "OldTownCross_1920x1080p50.y4m"
+        width: 1920
+        height: 1080
+        fps_num: 50
+        fps_denom: 1
+        bit_depth: 8
+        class: "A2"
+      # One 4K clip in the screening set on purpose. The prior research found
+      # that 4K and 1080p diverge systematically -- three reuse patches that
+      # looked good on small clips were all slower at 4K -- so a screening set
+      # with no 4K member cannot see the failure mode that killed them.
+      - id: "A1_Tango"
+        filename: "Tango_3840x2160_5994_10bit_420.y4m"
+        width: 3840
+        height: 2160
+        fps_num: 60000
+        fps_denom: 1001
+        bit_depth: 10
+        class: "A1"
+  holdout:
+    name: "a2-holdout"
+    config: "RA"
+    frames: 17
+    qps: [160, 210]
+    sequences:
+      - id: "A2_CrowdRun"
+        filename: "CrowdRun_1920x1080p50.y4m"
+        width: 1920
+        height: 1080
+        fps_num: 50
+        fps_denom: 1
+        bit_depth: 8
+        class: "A2"
+      - id: "A2_Riverbed"
+        filename: "Riverbed_1920x1080p25.y4m"
+        width: 1920
+        height: 1080
+        fps_num: 25
+        fps_denom: 1
+        bit_depth: 8
+        class: "A2"
+      - id: "A1_Crosswalk"
+        filename: "Crosswalk_3840x2160_5994fps_10bit_420.y4m"
+        width: 3840
+        height: 2160
+        fps_num: 60000
+        fps_denom: 1001
+        bit_depth: 10
+        class: "A1"

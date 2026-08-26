@@ -1,0 +1,34 @@
+# Everything simulated: no encoder, no cluster, no credentials.
+#
+# This is the site the test suite and CI use, and the one to start with on a new
+# machine -- it exercises the entire loop in seconds so the plumbing can be
+# verified before any real compute is spent. A run under this site is labelled
+# simulated in every report; none of its numbers describe the real encoder.
+
+project:
+  node_id: "sim"
+
+infra:
+  blobs: "local"
+  code: "none"
+  notifier: "file"
+  health: "local"
+  min_free_gib: 0.1
+
+ctc:
+  backend: "sim"
+
+agent:
+  llm: "offline"
+
+measure:
+  reps: 2
+  workers: 2
+  cpus_per_worker: 1
+  conformance_sample: 0
+  acceptance_mode: "point"
+  null_arm_every: 3
+
+planner:
+  ctc_min_arms: 1
+  require_holdout: true

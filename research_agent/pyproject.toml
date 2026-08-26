@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "av2ra"
+version = "1.0.0"
+description = "An autonomous research agent for the AV2 (libavm) encoder"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause-Clear" }
+
+# No required third-party dependency. numpy, scipy and PyYAML are used when
+# present and are not needed: PCHIP, the Student-t distribution and a YAML
+# subset are implemented in pure Python and tested against the reference
+# implementations. That matters because this runs on a Cloudtop, a laptop and a
+# minimal CI container, and a verdict that changes with the installed
+# distribution is not a verdict.
+dependencies = []
+
+[project.optional-dependencies]
+# The live model client. Without it the loop runs with agent.llm=offline.
+model = ["anthropic>=0.40"]
+# Faster paths for the pure-Python fallbacks, and the reference implementations
+# the test suite checks them against.
+fast = ["numpy", "scipy", "PyYAML"]
+
+[project.scripts]
+av2ra = "av2ra.cli:main"
+av2-agent = "av2ra.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["av2ra*"]
+
+[tool.setuptools.package-data]
+av2ra = ["../config/*.yaml", "../config/sites/*.yaml"]

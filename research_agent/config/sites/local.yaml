@@ -1,0 +1,23 @@
+# A workstation or laptop. No Google dependency at all.
+#
+# CTC defaults to the simulated back end because a full common-test-conditions
+# round on one machine is days of work: on a 2.8 GHz core this encoder needs
+# roughly 14 seconds per frame at 176x144 and cpu-used=4, which puts a 1080p
+# 17-frame encode in the hour range. Set ctc.backend=local to run the reduced
+# CTC anyway, and read what it reports about being reduced.
+
+infra:
+  blobs: "local"
+  code: "none"
+  notifier: "file"
+  health: "local"
+
+ctc:
+  backend: "sim"
+  local_qps: [110, 160, 185, 235]
+  local_max_4k_clips: 2
+
+measure:
+  workers: 2
+  cpus_per_worker: 2
+  acceptance_mode: "conservative"
